@@ -537,11 +537,11 @@ task_failed
 | Official MCP Registry | server name/title/description/version/package/transport/env/auth/repository | https://registry.modelcontextprotocol.io/ | 主要真实 Plugin Catalog |
 | MCP Registry API | `/v0.1/servers`、版本详情、增量同步 | https://github.com/modelcontextprotocol/registry/blob/main/docs/reference/api/official-registry-api.md | 可做可重复抓取 |
 | MCP `server.json` schema | package、transport、env variables、remote URL、repository | https://github.com/modelcontextprotocol/registry/blob/main/docs/reference/server-json/generic-server-json.md | 统一 Plugin manifest 的初始来源 |
-| Koishi Plugin Registry | npm package、版本、描述、manifest、publisher 等 | https://registry.koishi.chat/market.json | 真实 Cordis 插件生态；任务标签缺失 |
+| Koishi Plugin Registry | npm package、版本、描述、manifest、publisher 等 | https://registry.koishi.chat/index.json | 官方入口会重定向到带哈希的最新索引；真实 Cordis 插件生态，任务标签缺失 |
 | Koishi registry code | Registry 更新和部署逻辑 | https://github.com/koishi-actions/registry | 用于理解抓取与许可 |
 | DeepSeek Harness | 230+ workspace packages；Cordis config/bundles/contracts | https://github.com/deepseek-ai/deepseek-harness | 最贴近 Harness Plugin，但目录规模较小 |
 | dsh plugin topic | 社区 Harness 插件发现入口 | https://github.com/topics/dsh-plugin | 当前数量和质量需要后续抓取 |
-| VS Code Marketplace | extension metadata、版本、平台、下载、依赖/extension packs | https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery | 真实大规模插件目录；API 未正式文档化 |
+| VS Code Marketplace | extension metadata、版本、平台、下载、依赖/extension packs | https://github.com/microsoft/vscode-vsce/blob/main/src/publicgalleryapi.ts | 实际查询端点为 POST `/_apis/public/gallery/extensionquery`；API 未正式文档化 |
 | VS Code manifest spec | `extensionDependencies`、`extensionPack`、engines、contributes | https://code.visualstudio.com/api/references/extension-manifest | 可做外部生态依赖图 |
 
 ### 8.4 软件依赖与版本图
@@ -550,7 +550,7 @@ task_failed
 |---|---|---|---|
 | Libraries.io | 多生态 package metadata/dependency/license；站点当前索引近千万 packages | https://libraries.io/ | 依赖和许可分析，元数据未经人工验证 |
 | Libraries.io open data | 历史数据下载入口 | https://libraries.io/data | 后续核实许可与最新快照 |
-| npm-follower | npm 全量历史与已删除版本研究数据 | https://dependencies.science/ | 时间切分、版本漂移和供应链研究 |
+| npm-follower | npm 全量历史与已删除版本研究数据 | https://github.com/donald-pinckney/npm-follower | 数据站原入口 `dependencies.science` 当前 DNS 不稳定；先记录代码和论文入口 |
 | deps.dev | package/version/dependency/advisory 数据 | https://deps.dev/ | 版本、漏洞、依赖边与来源仓库 |
 
 ### 8.5 Harness 与运行时评测
