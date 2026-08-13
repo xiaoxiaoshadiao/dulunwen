@@ -1,0 +1,682 @@
+# 面向动态 Agent Harness 的运行时能力组合
+
+> 问题定义、相关工作、评测指标与公开数据资源清单  
+> Working title: **Learning to Compose Runtime Capabilities under Changing Environments**  
+> 调研日期：2026-08-13
+
+## 0. 文档状态与范围
+
+本文是“插件检索与动态组合”方向的第一版研究设计文档，目标是明确：
+
+1. 什么问题值得作为一篇面向 ICLR 的机器学习论文来研究；
+2. 它与 Skill Retrieval、Tool Retrieval、依赖图检索和 Harness 系统研究有什么区别；
+3. 理论形式、模型、指标与数据集应如何对应；
+4. 哪些论文需要归档，哪些公开数据和生态资源可复用。
+
+当前仅下载并归档论文 PDF。数据集、模型权重、插件包与容器镜像暂不下载；本文只记录其官方入口、规模、可用性和预期用途。
+
+---
+
+## 1. 核心建议
+
+### 1.1 推荐的问题名称
+
+建议将任务称为：
+
+> **Runtime-Conditioned Plugin Composition (RCPC)**  
+> 运行时状态条件下的插件组合
+
+问题不是“从目录中搜索几个相关插件”，而是：
+
+> 给定用户任务、当前运行环境、当前 Harness 组件图和插件目录，生成一个依赖闭合、策略可行、成本受控、可以执行并能够安全撤销的运行时配置增量。
+
+### 1.2 最适合论文的核心命题
+
+> Existing tool retrieval selects among capabilities that are already exposed.  
+> Runtime capability composition decides which capabilities should enter the agent runtime in the first place.
+
+中文表述：
+
+> 工具检索是在已经暴露的能力中选择调用对象；插件组合决定哪些工具、服务、策略、权限和副作用获准进入当前 Agent 运行时。
+
+### 1.3 为什么不能只做“插件依赖图检索”
+
+以下相邻问题已经有直接工作：
+
+- Tool Graph Retriever 已研究依赖图增强的工具检索；
+- Graph RAG-Tool Fusion 已研究根工具检索后的依赖图扩展；
+- SkillWeaver 已研究任务分解、Skill 检索与 DAG 组合；
+- Dynamic Tool Dependency Retrieval 已研究随执行计划变化的动态工具检索；
+- ToolOmni 已研究开放工具库中的主动检索与执行；
+- DynamicMCPBench 已研究真实 MCP Server 上基于执行效果的评测；
+- ToolGym 已提供工具、状态、约束层面的动态扰动；
+- Harness-Bench 已证明 Harness 配置会显著影响最终任务表现。
+
+因此，单独提出“图检索”“多插件组合”“运行时执行”或“状态扰动”都不足以形成清晰的新问题。本文建议占据的空白是四者的交集：
+
+1. **Environment-conditioned**：同一任务在不同环境中应产生不同的插件方案；
+2. **Graph-valued output**：输出依赖闭合的配置图，而非平面 Top-K；
+3. **Execution-verified supervision**：正负标签来自可重放执行，而非只来自 LLM 判断；
+4. **Lifecycle-aware evaluation**：成功不仅是完成任务，还包括权限合规和卸载后的状态恢复。
+
+---
+
+## 2. 问题形式化
+
+### 2.1 输入
+
+对每个任务定义：
+
+```text
+q：用户任务
+
+E：运行环境
+   - OS、CPU 架构、运行时版本
+   - 网络与 egress policy
+   - 可用凭据与认证方式
+   - CPU/GPU/内存
+   - 文件系统和服务权限
+   - 延迟、费用和资源预算
+
+H：当前 Harness 状态
+   - 已安装和已激活插件
+   - 当前 provider bindings
+   - Agent/session scope
+   - 正在运行的任务
+   - 当前 model、memory、tools、policy 组件
+
+P：可用 Plugin Catalog
+```
+
+### 2.2 Plugin Contract
+
+一个可组合插件不应只由 README 表示。建议定义：
+
+```text
+Plugin p = (
+    descriptor,
+    requires,
+    provides,
+    config_schema,
+    permissions,
+    platform_constraints,
+    resource_cost,
+    effects,
+    disposer
+)
+```
+
+- `descriptor`：自然语言描述、工具 schema、示例，用于语义检索；
+- `requires/provides`：组件依赖契约；
+- `config_schema`：可配置参数；
+- `permissions`：文件、网络、凭据和外部服务权限；
+- `platform_constraints`：OS、架构、语言运行时和版本；
+- `resource_cost`：安装、冷启动、显存、内存、延迟和费用；
+- `effects`：激活后会注册或修改的状态；
+- `disposer`：卸载时的逆操作或补偿策略。
+
+第一版论文应明确限定为 **executable capability plugins**：可以安装、提供工具或服务、具有运行时依赖的插件。Agent Loop、UI、完整 Session Store 等任意 Harness 内核替换可作为扩展实验，而不是第一版数据集必须覆盖的对象。
+
+### 2.3 输出
+
+输出不是 Plugin Set，而是配置计划：
+
+```text
+Plan π = (
+    selected_plugins,
+    dependency_bindings,
+    configurations,
+    scopes,
+    activation_order,
+    disposal_order
+)
+```
+
+更接近工程接口的表示是 Harness 配置增量：
+
+```text
+f(q, E, H, P) -> ΔH
+H' = Apply(H, ΔH)
+```
+
+其中 `ΔH` 可以包含：
+
+```text
+ADD plugin
+KEEP plugin
+REMOVE plugin
+BIND capability -> provider
+SET config
+SET scope / isolation
+SET permission policy
+STOP
+```
+
+### 2.4 可行性约束
+
+一个有效计划至少满足：
+
+1. **Task sufficiency**：能力覆盖任务所需效果；
+2. **Dependency closure**：每个 `requires` 都有合法 provider；
+3. **Provider consistency**：互斥 provider 不发生冲突；
+4. **Acyclic precedence**：依赖先后关系无不可解循环；
+5. **Version/platform compatibility**：版本、OS、架构和运行时匹配；
+6. **Policy feasibility**：权限不超过当前 policy；
+7. **Resource feasibility**：资源、延迟和费用不超预算；
+8. **Lifecycle feasibility**：插件可激活、可停用，副作用可撤销或补偿；
+9. **Minimality**：避免不必要插件，尽量复用当前组件，减少 Harness churn。
+
+### 2.5 优化目标
+
+```text
+最大化：
+    任务完成概率
+    + 语义覆盖
+    + 插件集合兼容性
+
+最小化：
+    安装与冷启动成本
+    + 执行延迟和费用
+    + 权限及供应链风险
+    + Harness 修改量
+    + 不可逆副作用风险
+
+同时满足所有硬约束。
+```
+
+---
+
+## 3. 理论部分的建议
+
+### 3.1 独立排序的不充分性
+
+需要证明：当集合效用包含 complementarity、substitution 或 conflict 时，逐插件独立分数不能表示一般的最优插件集合。
+
+构造示例：
+
+```text
+A、B、C 对 query 单独都相关；
+A + B 存在 provider 冲突；
+A + C 能组成完整流水线。
+```
+
+如果 `score(p | q, E)` 不依赖已经选择了哪些插件，它无法完整表达“选择 C 后 A 的边际价值”和“选择 B 后 A 的冲突”。这可形式化为非加性集合效用下独立 Top-K 的不可表示性。
+
+### 3.2 组合复杂度
+
+简化到以下情形：
+
+```text
+任务需要一组 capabilities；
+每个 Plugin 覆盖若干 capabilities；
+每个 Plugin 有成本；
+目标是最低成本覆盖全部能力。
+```
+
+该问题可由 Weighted Set Cover 规约，因此已经是 NP-hard。加入依赖、provider、版本、权限和资源约束后只会更难。这一结果为“学习检索缩小搜索空间 + 确定性约束求解保证合法”的混合架构提供理论动机。
+
+### 3.3 生命周期正确性
+
+不必重新完整证明 Cordis 的演算，可以在明确假设下复用其结论：
+
+- 依赖闭合且 precedence 无环；
+- 原子 effect 的 inverse 正确；
+- 跨组件 effects 独立，或顺序由依赖显式表达；
+- provision 合法且组件数量有限。
+
+在这些前提下，可说明插件图能够进入稳定状态，provider 先于 consumer 激活、晚于 consumer 退出，卸载后恢复到观察等价状态。
+
+需要明确：Cordis 运行时只组合和调度作者提供的 inverse，并不会自动产生或验证 inverse；外部网络消息、支付、邮件等 emission 不属于严格可逆状态。
+
+### 3.4 Counterfactual State
+
+同一个 query 在不同环境中应选择不同 Plan：
+
+```text
+允许外网 + 有 API Key -> 远程搜索/模型插件；
+禁止外网 + 有本地快照 -> 本地索引/模型插件。
+
+有集群写权限 -> 诊断 + 修复插件；
+只读权限 -> 只允许诊断插件。
+
+Qdrant 已激活 -> 复用 Qdrant；
+只有 Elasticsearch 已激活 -> 绑定 Elasticsearch provider。
+```
+
+由此定义两类一致性：
+
+- **Relevant-state sensitivity**：影响可行性的环境变化应导致计划切换；
+- **Irrelevant-state invariance**：无关状态变化不应扰动计划。
+
+这应成为区别于普通 Tool Retrieval 的关键训练信号和评测维度。
+
+---
+
+## 4. 方法草案：State-Conditioned Plugin Composer
+
+暂用方法名 `PlugR`，正式命名待后续确定。
+
+### 4.1 Stage 1：Root Plugin Retrieval
+
+编码以下信息：
+
+```text
+query
++ environment summary
++ current active graph summary
++ policy / budget
+```
+
+从大目录召回语义相关的根插件。该阶段追求高召回，不能承担完整依赖和安全决策。
+
+### 4.2 Stage 2：Contract-Aware Graph Composition
+
+构建异构图：
+
+```text
+Plugin nodes
+Capability nodes
+Environment nodes
+Policy nodes
+```
+
+边包括：
+
+```text
+requires
+provides
+conflicts
+already-active
+version-compatible
+permission-allows
+platform-compatible
+```
+
+模型自回归生成配置动作或对候选计划评分。
+
+### 4.3 Stage 3：Deterministic Verifier
+
+确定性检查：
+
+```text
+dependency closure
+acyclicity
+version/platform
+permissions
+resource budget
+provider conflicts
+```
+
+无效动作应在 constrained decoding 中 hard-mask，或在 verifier-guided beam search 中剔除。语义判断交给模型，结构可行性尽量不交给 LLM 猜测。
+
+### 4.4 Stage 4：Execution Critic
+
+在隔离运行时中：
+
+1. 应用候选配置；
+2. 检查插件激活与健康状态；
+3. 执行任务；
+4. 对照 effect checkpoints；
+5. 触发卸载；
+6. 检查 policy violation、teardown timeout 和状态泄漏。
+
+训练目标可以包含：
+
+```text
+Root Retrieval Loss
++ Graph Action Loss
++ Feasibility Ranking Loss
++ Counterfactual Consistency Loss
++ Execution Preference Loss（可选）
+```
+
+---
+
+## 5. 指标设计
+
+### 5.1 检索层
+
+- Root Recall@K
+- Root NDCG@K
+- Candidate efficiency / catalog reduction
+
+### 5.2 组合图层
+
+- Plugin Set Precision / Recall
+- Graph Exact Match（仅作诊断）
+- Dependency Edge F1
+- Dependency Closure Rate
+- Provider Binding Accuracy
+- Minimality / Redundancy Rate
+
+### 5.3 环境条件层
+
+- Feasible@K
+- Counterfactual Switch Accuracy
+- Irrelevant-State Invariance
+- Version / platform generalization
+
+### 5.4 成本层
+
+- Plugin Count Regret
+- Installation Cost Regret
+- Cold-Start Latency
+- Harness Churn
+- Token / tool-schema exposure cost
+
+### 5.5 执行层
+
+- Effect Completion
+- End-to-End Task Success
+- Minefield / forbidden action rate
+- Action and tool-call efficiency
+
+### 5.6 生命周期与安全层
+
+建议定义 headline metric：
+
+> **Reversible Task Success (RTS)**
+
+一次运行只有同时满足以下条件才记为成功：
+
+1. required effects 完成；
+2. 没有权限或安全违规；
+3. 插件正常停用和卸载；
+4. 卸载后运行时状态与初始状态观察等价。
+
+另外单独报告：
+
+- Rollback Completeness
+- Resource Leak Rate
+- Teardown Timeout Rate
+- Policy Violation Rate
+- External Side-Effect Error
+
+由于多个插件方案可能 effect-equivalent，最终评测应优先检查“是否产生正确效果且符合约束”，不能只检查是否等于唯一 gold Plugin Set。
+
+---
+
+## 6. 数据集设计
+
+建议拆成两个互补子集，避免“规模”和“真实执行”互相牺牲。
+
+### 6.1 PlugBench-Retrieve
+
+大规模静态目录：
+
+```text
+Catalog：2K–10K 真实 MCP / Koishi / Harness capability plugins
+Tasks：数万条 query + environment + candidate graph
+用途：语义召回、环境条件匹配、依赖补全和 hard-negative 训练
+```
+
+### 6.2 PlugBench-Execute
+
+较小但完全可执行：
+
+```text
+100–200 个容器化 capability plugins
+1K–2K 个执行任务
+每条任务包含多个 environment variants
+```
+
+每个测试实例必须可以：
+
+```text
+安装 -> 激活 -> 执行 -> 验证 effect -> 卸载 -> 检查状态恢复
+```
+
+### 6.3 数据生成流水线
+
+1. 从公开 Registry/Marketplace 获取 Plugin manifest；
+2. 启动插件，枚举 tools/resources/prompts/config；
+3. 用 explorer agent 在真实沙箱中完成任务并记录成功轨迹；
+4. 从成功轨迹蒸馏 required effects、可替代 effects、partial order 与 minefields；
+5. 生成反事实环境：凭据缺失、egress 变化、权限收紧、资源变化、provider 不可用、版本变化、已有 provider 变化；
+6. 对每个新环境重新寻找成功 Plan，或由约束求解器和多次执行确认不可完成；
+7. 保留结构化 Reject；
+8. 在 deterministic replay 中重复验证；
+9. 对测试集做多专家审核。
+
+不能因为一个弱 Agent 执行失败就标注 `impossible`。不可行标签至少需要静态约束证明，或强 explorer、多次 replay 与人工审核共同确认。
+
+### 6.4 Reject-as-Runtime-Signal
+
+建议的失败标签：
+
+```text
+semantic_mismatch
+dependency_unsatisfied
+dependency_cycle
+provider_collision
+version_conflict
+platform_incompatible
+permission_denied
+credential_missing
+budget_exceeded
+install_failed
+activation_failed
+health_check_failed
+effect_failed
+teardown_timeout
+rollback_leak
+task_failed
+```
+
+### 6.5 数据划分
+
+- Plugin-disjoint split
+- Composition-disjoint split
+- Counterfactual-environment split
+- Version / temporal split
+- Cross-lingual split
+- Long-chain and high-branching stress split
+- Equivalent-provider split
+
+---
+
+## 7. 相关论文归档清单
+
+论文 PDF 下载到远程目录 `papers/`。本表给出官方来源和本地文件名。
+
+| # | 论文 | 官方链接 | 本地 PDF |
+|---|---|---|---|
+| 01 | A Programming Paradigm for Spatiotemporal Composability | https://github.com/cordiverse/paper/blob/main/paper.pdf | `01-cordis-spatiotemporal-composability.pdf` |
+| 02 | Skill Is Not Document | https://arxiv.org/abs/2606.03565 | `02-r3-skill-routing.pdf` |
+| 03 | Compositional Skill Routing for LLM Agents | https://arxiv.org/abs/2606.18051 | `03-compositional-skill-routing.pdf` |
+| 04 | Tool Graph Retriever | https://arxiv.org/abs/2508.05152 | `04-tool-graph-retriever.pdf` |
+| 05 | Graph RAG-Tool Fusion | https://arxiv.org/abs/2502.07223 | `05-graph-rag-tool-fusion.pdf` |
+| 06 | GTool: Graph Enhanced Tool Planning | https://arxiv.org/abs/2508.12725 | `06-gtool.pdf` |
+| 07 | Dynamic Tool Dependency Retrieval | https://aclanthology.org/2026.findings-acl.1680/ | `07-dynamic-tool-dependency-retrieval.pdf` |
+| 08 | Retrieval Models Aren't Tool-Savvy (ToolRet) | https://arxiv.org/abs/2503.01763 | `08-toolret.pdf` |
+| 09 | ToolOmni | https://arxiv.org/abs/2604.13787 | `09-toolomni.pdf` |
+| 10 | C-World / ToolGym | https://arxiv.org/abs/2601.06328 | `10-c-world-toolgym.pdf` |
+| 11 | ToolSandbox | https://arxiv.org/abs/2408.04682 | `11-toolsandbox.pdf` |
+| 12 | MCP-Atlas | https://arxiv.org/abs/2602.00933 | `12-mcp-atlas.pdf` |
+| 13 | MCP-Bench | https://arxiv.org/abs/2508.20453 | `13-mcp-bench.pdf` |
+| 14 | ETOM / MSC-Bench | https://arxiv.org/abs/2510.19423 | `14-etom-msc-bench.pdf` |
+| 15 | DynamicMCPBench | https://arxiv.org/abs/2607.20531 | `15-dynamic-mcp-bench.pdf` |
+| 16 | Harness-Bench | https://arxiv.org/abs/2605.27922 | `16-harness-bench.pdf` |
+| 17 | ToolBench | https://arxiv.org/abs/2307.16789 | `17-toolbench.pdf` |
+
+---
+
+## 8. 公开数据集与代码资源入口（当前不下载）
+
+### 8.1 Skill / Tool Retrieval
+
+| 资源 | 规模与内容 | 官方入口 | 可用于本项目 |
+|---|---|---|---|
+| R3-Skill | 10,246 skills；41,592 WRITE queries；32,828 SKIP；中英四方向 | https://github.com/Tencent/R3-Skill | 语义兼容性预训练、Reject taxonomy |
+| SkillRet | 10,123 train skills；6,660 test skills；63,259 train queries；4,997 test queries | https://github.com/ThakiCloud/SKILLRET | 大规模 Skill Retrieval baseline |
+| SkillRet HF | Hugging Face 数据入口 | https://huggingface.co/datasets/ThakiCloud/SKILLRET | 数据下载入口，暂不下载 |
+| ToolRet | 43K tools；7.6K eval tasks；200K+ train instances | https://github.com/mangopy/tool-retrieval-benchmark | 大规模 Tool Retrieval 预训练与 baseline |
+| ToolRet HF collection | ToolRet 数据集合 | https://huggingface.co/collections/mangopy/tool-retrieval | 数据下载入口，暂不下载 |
+| ToolLinkOS | 573 fictional tools；1,569 instances；平均 6.3 dependencies/tool | https://github.com/EliasLumer/Graph-RAG-Tool-Fusion-ToolLinkOS | 依赖图 baseline 与图指标 |
+| TDI300K | 约 300K tool dependency pairs；论文中由代码函数和 LLM 生成 | https://arxiv.org/abs/2508.05152 | 依赖边识别预训练；需核实正式数据下载入口 |
+| CompSkillBench | 2,209 MCP skills；300 compositional queries；GT chains | https://arxiv.org/abs/2606.18051 | 组合 query 与顺序种子；论文未给出可靠官方代码入口 |
+
+### 8.2 Executable Tool / MCP Benchmarks
+
+| 资源 | 规模与内容 | 官方入口 | 可用于本项目 |
+|---|---|---|---|
+| MCP-Atlas | 36 real MCP servers；220 tools；1,000 tasks；500 public | https://arxiv.org/abs/2602.00933 | 容器化可执行核心、跨 server tasks |
+| MCP-Atlas leaderboard | 公开评测入口 | https://labs.scale.com/leaderboard/mcp_atlas | 任务协议与基线信息 |
+| MCP-Bench | 28 MCP servers；250 tools；104 single/multi-server tasks | https://github.com/accenture/mcp-bench | 第一版可执行 world，代码和 server 较完整 |
+| DynamicMCPBench | 121 live servers；1,845 tasks；effect checkpoints；partial order | https://arxiv.org/abs/2607.20531 | 最接近 execution-grounded generation；代码/数据标注为 publication 时发布 |
+| ETOM / MSC-Bench | 491 servers；2,375 tools；equal function sets | https://arxiv.org/abs/2510.19423 | 等价 provider 与多方案评测；需核实代码入口 |
+| ToolGym | 204 applications；5,571 tools；状态/约束扰动；动态 MCP loading | https://github.com/Ziqiao-git/ToolGym | Counterfactual environment 与 robustness |
+| ToolSandbox | 约 34 stateful tools；1,032 scenarios；milestones/minefields | https://github.com/apple/ToolSandbox | 状态依赖、执行里程碑和 minefield |
+| ToolBench | 16,464 APIs；126K+ instances | https://github.com/OpenBMB/ToolBench | 大规模工具语义和调用链数据 |
+| LiveMCPBench | 大规模 MCP toolset、真实任务和 Docker 环境 | https://github.com/icip-cas/LiveMCPBench | 补充大目录工具导航与执行 |
+
+### 8.3 Plugin Catalog / Marketplace
+
+| 资源 | 可获得字段 | 官方入口 | 备注 |
+|---|---|---|---|
+| Official MCP Registry | server name/title/description/version/package/transport/env/auth/repository | https://registry.modelcontextprotocol.io/ | 主要真实 Plugin Catalog |
+| MCP Registry API | `/v0.1/servers`、版本详情、增量同步 | https://github.com/modelcontextprotocol/registry/blob/main/docs/reference/api/official-registry-api.md | 可做可重复抓取 |
+| MCP `server.json` schema | package、transport、env variables、remote URL、repository | https://github.com/modelcontextprotocol/registry/blob/main/docs/reference/server-json/generic-server-json.md | 统一 Plugin manifest 的初始来源 |
+| Koishi Plugin Registry | npm package、版本、描述、manifest、publisher 等 | https://registry.koishi.chat/market.json | 真实 Cordis 插件生态；任务标签缺失 |
+| Koishi registry code | Registry 更新和部署逻辑 | https://github.com/koishi-actions/registry | 用于理解抓取与许可 |
+| DeepSeek Harness | 230+ workspace packages；Cordis config/bundles/contracts | https://github.com/deepseek-ai/deepseek-harness | 最贴近 Harness Plugin，但目录规模较小 |
+| dsh plugin topic | 社区 Harness 插件发现入口 | https://github.com/topics/dsh-plugin | 当前数量和质量需要后续抓取 |
+| VS Code Marketplace | extension metadata、版本、平台、下载、依赖/extension packs | https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery | 真实大规模插件目录；API 未正式文档化 |
+| VS Code manifest spec | `extensionDependencies`、`extensionPack`、engines、contributes | https://code.visualstudio.com/api/references/extension-manifest | 可做外部生态依赖图 |
+
+### 8.4 软件依赖与版本图
+
+| 资源 | 内容 | 官方入口 | 备注 |
+|---|---|---|---|
+| Libraries.io | 多生态 package metadata/dependency/license；站点当前索引近千万 packages | https://libraries.io/ | 依赖和许可分析，元数据未经人工验证 |
+| Libraries.io open data | 历史数据下载入口 | https://libraries.io/data | 后续核实许可与最新快照 |
+| npm-follower | npm 全量历史与已删除版本研究数据 | https://dependencies.science/ | 时间切分、版本漂移和供应链研究 |
+| deps.dev | package/version/dependency/advisory 数据 | https://deps.dev/ | 版本、漏洞、依赖边与来源仓库 |
+
+### 8.5 Harness 与运行时评测
+
+| 资源 | 内容 | 官方入口 | 可用于本项目 |
+|---|---|---|---|
+| Harness-Bench | 106 sandboxed tasks；6 harnesses × 8 model backends；5,194 traces | https://arxiv.org/abs/2605.27922 | 证明 Harness 配置影响；可借鉴环境/安全/过程指标 |
+| Cordis paper | Revertible effects、reactive coeffects、动态组合演算 | https://github.com/cordiverse/paper/blob/main/paper.pdf | 生命周期理论基础 |
+| Cordis implementation | Context/effect/coeffect/fiber runtime | https://github.com/cordiverse/cordis | 可执行 Plugin composition runtime |
+
+---
+
+## 9. Baselines
+
+### 9.1 Flat Retrieval
+
+- BM25
+- BGE-M3 / Qwen Embedding
+- ToolRet retriever
+- R3-Embedding / R3-Reranker
+- LLM listwise selection over retrieved candidates
+
+### 9.2 Dependency-Aware Retrieval
+
+- Graph RAG-Tool Fusion
+- Tool Graph Retriever
+- GTool
+- Dynamic Tool Dependency Retrieval
+- SkillWeaver
+
+### 9.3 Agentic Retrieval and Execution
+
+- ToolOmni
+- ToolGym built-in FAISS retriever
+- MCP-Atlas / MCP-Bench default exposure
+- all-manifest LLM planner（仅小目录）
+
+### 9.4 Constraint Baselines
+
+- semantic root retrieval + deterministic dependency expansion
+- solver-only contract composition
+- LLM plan + post-hoc verifier
+- oracle root plugin + learned composer
+- learned root retriever + oracle contract solver
+
+---
+
+## 10. 关键实验问题
+
+1. **RQ1：环境状态是否改变正确插件选择？**  
+   比较 query-only、query+environment、query+environment+current graph。
+
+2. **RQ2：平面 Top-K 是否不如图组合？**  
+   比较 flat retrievers、graph retrievers、constrained composer。
+
+3. **RQ3：Plugin Contract 的哪些字段最有用？**  
+   README only、+tool schemas、+requires/provides、+permission/platform、+lifecycle/effect。
+
+4. **RQ4：Execution Reject 是否优于 LLM Reject？**  
+   比较无 Reject、语义 Reject、静态 contract Reject、runtime Reject。
+
+5. **RQ5：是否泛化到新插件、新版本和新组合？**  
+   Plugin-disjoint、version split、composition-disjoint、long-chain。
+
+6. **RQ6：是否真正完成且可恢复？**  
+   同时报告 Task Success、RTS、资源泄漏、权限违规和冷启动成本。
+
+---
+
+## 11. 主要风险与规避
+
+### 11.1 “Plugin”定义过宽
+
+第一版限定 executable capability plugin，不直接覆盖可替换 Agent Loop 或整个 UI。
+
+### 11.2 MCP Server 不等于任意 Harness Plugin
+
+论文必须说明 MCP Server 是一种具有清晰工具表面的 capability plugin 实例。更一般的 memory/policy/model-router 插件通过小规模 Harness case study 验证。
+
+### 11.3 合成环境过于玩具化
+
+环境扰动必须来自真实 contract、服务器错误、权限策略或生产 trace；测试集由真实容器执行和人工审核。
+
+### 11.4 唯一 Gold Plan 不成立
+
+使用 effect checkpoints、equivalent providers 和 cost/risk constraints 定义等价成功方案，不强制匹配唯一工具链。
+
+### 11.5 LLM 生成偏差
+
+训练 query 可由多模型生成；测试 query 采用真实 benchmark query、多人改写和专家审核。正负可行性以执行和确定性验证为主。
+
+### 11.6 论文滑向纯系统工作
+
+面向 ICLR 时，主线必须是：
+
+```text
+新的学习问题
++ counterfactual state supervision
++ state-conditioned graph composer
++ executable benchmark
+```
+
+Cordis runtime 和配置系统作为语义与执行载体，而不是全文唯一贡献。
+
+---
+
+## 12. 推荐的论文贡献结构
+
+1. **Problem**：首次系统定义 Runtime-Conditioned Plugin Composition；
+2. **Theory**：独立排序不充分、组合 NP-hard、contract/lifecycle 可行性；
+3. **Data**：PlugBench-Retrieve + PlugBench-Execute；
+4. **Generation**：forward execution、effect distillation、counterfactual environment、typed rejects；
+5. **Method**：state-conditioned root retriever + constrained graph composer + execution critic；
+6. **Metrics**：Counterfactual Plan Consistency 与 Reversible Task Success；
+7. **Evidence**：大目录检索、真实容器执行、生命周期恢复和跨环境泛化。
+
+---
+
+## 13. 下一步
+
+1. 核实所有论文 PDF、代码仓库与数据许可；
+2. 为 MCP Server、Koishi Plugin 和 dsh bundle 设计统一的最小 Plugin Contract；
+3. 先用 MCP-Bench 的 28 个 Server 做可执行原型；
+4. 将 MCP-Bench 每个任务改造成“server 未预挂载”的 Plugin Retrieval 设置；
+5. 为同一 query 构造网络、凭据、权限和 provider 状态的反事实环境；
+6. 实现 flat retrieval、dependency expansion 和 constraint solver 三个最小 baseline；
+7. 验证任务是否真的需要学习式 composer，而不是纯规则即可解决；
+8. 通过后再扩到 MCP-Atlas、ToolGym 和更大的 MCP Registry catalog。
+
