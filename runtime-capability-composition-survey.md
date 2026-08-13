@@ -6,9 +6,9 @@
 
 ## 0. 文档状态与范围
 
-本文是“插件检索与动态组合”方向的第一版研究设计文档，目标是明确：
+本文是“插件检索与动态组合”方向的第一版研究讨论文档，目标是明确：
 
-1. 什么问题值得作为一篇面向 ICLR 的机器学习论文来研究；
+1. 当前问题是否成立，研究边界在哪里；
 2. 它与 Skill Retrieval、Tool Retrieval、依赖图检索和 Harness 系统研究有什么区别；
 3. 理论形式、模型、指标与数据集应如何对应；
 4. 哪些论文需要归档，哪些公开数据和生态资源可复用。
@@ -17,9 +17,9 @@
 
 ---
 
-## 1. 核心建议
+## 1. 当前问题定义
 
-### 1.1 推荐的问题名称
+### 1.1 暂用的问题名称
 
 建议将任务称为：
 
@@ -30,7 +30,7 @@
 
 > 给定用户任务、当前运行环境、当前 Harness 组件图和插件目录，生成一个依赖闭合、策略可行、成本受控、可以执行并能够安全撤销的运行时配置增量。
 
-### 1.2 最适合论文的核心命题
+### 1.2 当前用于区分相邻工作的命题
 
 > Existing tool retrieval selects among capabilities that are already exposed.  
 > Runtime capability composition decides which capabilities should enter the agent runtime in the first place.
@@ -52,7 +52,7 @@
 - ToolGym 已提供工具、状态、约束层面的动态扰动；
 - Harness-Bench 已证明 Harness 配置会显著影响最终任务表现。
 
-因此，单独提出“图检索”“多插件组合”“运行时执行”或“状态扰动”都不足以形成清晰的新问题。本文建议占据的空白是四者的交集：
+因此，单独提出“图检索”“多插件组合”“运行时执行”或“状态扰动”都不足以形成清晰的新问题。当前文献中尚未看到由同一任务完整覆盖以下四个方面的工作：
 
 1. **Environment-conditioned**：同一任务在不同环境中应产生不同的插件方案；
 2. **Graph-valued output**：输出依赖闭合的配置图，而非平面 Top-K；
@@ -249,6 +249,216 @@ Qdrant 已激活 -> 复用 Qdrant；
 - **Irrelevant-state invariance**：无关状态变化不应扰动计划。
 
 这应成为区别于普通 Tool Retrieval 的关键训练信号和评测维度。
+
+### 3.5 Cordis 论文：动态组合的理论来源与边界
+
+核心参考：
+
+> Yifan Shi, Wei Zhang, Tianyi Cui.  
+> **A Programming Paradigm for Spatiotemporal Composability.**  
+> Peking University / DeepSeek-AI，88 页技术论文。  
+> PDF：https://github.com/cordiverse/paper/blob/main/paper.pdf
+
+这篇论文不是插件检索论文，也没有提供插件检索数据。它讨论的是一个插件已经被选中并进入运行时之后，组件如何加载、依赖、退出和恢复。因此它更适合作为本项目的**运行时语义和评测边界**，而不是直接作为检索方法的先验结果。
+
+#### 3.5.1 论文提出的两个维度
+
+Cordis 将动态组合拆成两个相互独立但需要同时满足的维度：
+
+```text
+Temporal composability：
+组件退出时，能否撤销它对共享环境造成的修改。
+
+Spatial composability：
+组件能否声明对其他组件的依赖，并在 provider
+出现、消失或更换时自动调整生命周期。
+```
+
+论文将二者分别对应到：
+
+```text
+Revertible effects：
+每次 context transformation 同时返回 inverse，
+运行时记录并按 LIFO 顺序组合这些 inverse。
+
+Reactive coeffects：
+组件声明所需 dependency keys；
+每次 Context 改变后，运行时重新判断依赖是
+activating、deactivating 还是 neutral。
+```
+
+对本文问题的直接意义是：Plugin Contract 不能只有描述和工具 schema，还需要表达“它需要什么、提供什么、改变什么、如何退出”。
+
+#### 3.5.2 Context、Component 与 Fiber
+
+Cordis 的 Context 同时承载：
+
+```text
+当前状态
++ inverse accumulator
++ dependency / coeffect table
++ child contexts
+```
+
+组件可抽象为：
+
+```text
+Component = (
+    requires,
+    provides,
+    effect
+)
+```
+
+组件的一次运行时实例称为 Fiber，额外记录：
+
+```text
+parent
+lifecycle state
+committed dependency view
+target dependency view
+accumulated disposer
+retirement state
+```
+
+与本文拟议形式的对应关系如下：
+
+| Cordis 概念 | 本文中的含义 | 可观测数据 |
+|---|---|---|
+| Context | 环境 `E` 与当前 Harness 状态 `H` | OS、权限、providers、active graph、policy |
+| Component | Plugin Contract | requires、provides、effect、disposer |
+| Fiber | 一次 Plugin activation | instance id、scope、lifecycle、resource handles |
+| Committed view | 激活时实际绑定的 providers | capability → provider instance |
+| Target view | 当前环境下应该绑定的 providers | 环境变化后的候选 bindings |
+| Effect accumulator | 当前插件已产生副作用的撤销链 | registrations、processes、timers、connections |
+| Isolation realm | 不同 Agent/session 下的 provider 隔离 | workspace、credentials、memory、tool namespace |
+| Interception metadata | 外层施加的调用约束 | read-only、path allowlist、budget、rate limit |
+
+因此，本文中 `f(q, E, H, P) -> ΔH` 的输出可以直接解释为对 Context/Fiber 树的期望状态修改，而 Cordis Loader 负责把配置增量协调为运行时生命周期变化。
+
+#### 3.5.3 生命周期和依赖顺序
+
+Cordis 的完整生命周期包括：
+
+```text
+INACTIVE
+  -> LOADING
+  -> ACTIVE
+  -> UNLOADING
+  -> INACTIVE
+```
+
+关键语义不是简单的“依赖不存在就停止”，而是：
+
+1. provider 激活后，consumer 才能激活；
+2. consumer 记录激活时解析到的 provider identity；
+3. provider 准备退出时，先停止向新 consumer 提供服务；
+4. 已绑定 consumer 在 teardown 中仍可使用 committed provider；
+5. consumer 全部退出后，provider 才执行自己的 inverse。
+
+这为数据和指标提供了比“插件是否安装成功”更细的观察点：
+
+- activation order 是否正确；
+- dependency view 在一次 transition 内是否保持一致；
+- provider replacement 是否触发正确范围的 reload；
+- consumer teardown 是否先于 provider disposal；
+- partial activation 失败后是否撤销已完成 effects。
+
+#### 3.5.4 论文的主要形式结论
+
+在其形式化假设下，Cordis 证明或讨论了：
+
+1. **Preservation**：生命周期转换后 registry 仍保持结构合法；
+2. **Recovery exactness**：卸载某组件只删除该组件的贡献，保留其他独立组件的贡献；
+3. **Ordering**：provider 的活动区间包围 consumer 的活动区间；
+4. **Resolution coherence**：一次 activation 不会混用两组 provider 解析；
+5. **Progress**：无环、有限、effect steps 有界时，系统最终进入稳定状态；
+6. **Confluence**：满足额外条件且无失败时，最终稳定状态等价于按最终配置从头装配一次。
+
+这些结果支持把“最终配置图”作为 Plugin Composer 的输出，但不能直接证明某个学习模型能找到正确配置，也不能证明任意第三方插件均满足这些条件。
+
+#### 3.5.5 保证成立所需的假设
+
+文档与后续实验必须显式记录以下前提：
+
+```text
+所有要管理的共享交互都经过 Context；
+每个原子 effect 提供正确 inverse；
+跨组件 effects 独立，或顺序由 dependency 明确表达；
+dependency precedence 无环；
+组件和每次 activation 的步骤有限；
+confluence 还要求 total provision 且没有 failed fiber。
+```
+
+当前 TypeScript 实现不会自动验证 inverse 是否真的正确，也不会阻止组件绕过 Context 直接访问 Node.js 文件系统、网络或全局变量。Context 能够做 capability mediation，但不能替代进程、容器或 Wasm sandbox。
+
+#### 3.5.6 系统边界与不可逆操作
+
+Cordis 区分：
+
+```text
+Acquisition：
+打开连接、注册句柄、启动进程；
+通常可以通过 close/unregister/kill 撤销。
+
+Emission：
+发送网络消息、写入外部共享存储、支付、发邮件；
+一旦被外部观察，通常无法严格撤销。
+```
+
+对 emission 只能采用：
+
+- 延迟提交；
+- transaction / outbox；
+- idempotency key；
+- compensation；
+- 人工审批。
+
+因此，本文提出的 `Reversible Task Success` 必须限定在可观测系统边界内。对不可逆外部操作，应评测“未越权、未重复、补偿是否完成”，不能宣称恢复到物理相同状态。
+
+#### 3.5.7 Cordis 对 benchmark 的具体约束
+
+如果采用 Cordis 作为执行载体，建议每条任务记录：
+
+```text
+initial context snapshot
+desired effects
+selected plugin graph
+provider bindings
+activation trace
+effect ledger
+policy decisions
+task effects
+disposal trace
+final observable snapshot
+```
+
+由此可计算：
+
+- Dependency Closure；
+- Ordering Violation；
+- Provider Churn；
+- Partial-Activation Rollback；
+- Teardown Completion；
+- Observable State Restoration；
+- Reversible Task Success。
+
+#### 3.5.8 与本研究的关系应如何表述
+
+客观表述应是：
+
+> Cordis 给出了动态组件组合的一套条件化运行时语义。本文考虑在任务和环境条件下学习生成满足类似契约的插件配置，并通过执行验证其可行性。
+
+不应表述为：
+
+```text
+Cordis 已经证明插件检索问题成立；
+Cordis 已经保证任意插件能够安全热替换；
+使用 Cordis 就自动获得安全自演化；
+Koishi 的 4000 个插件已经验证了本文拟议模型。
+```
+
+Koishi 案例只能说明这种组件抽象在一个 TypeScript 生态中被长期采用。论文也明确承认其证据是观察性案例，没有受控性能比较、开发效率评测或 Cordis v4 全部假设的生产验证。
 
 ---
 
@@ -642,9 +852,9 @@ task_failed
 
 训练 query 可由多模型生成；测试 query 采用真实 benchmark query、多人改写和专家审核。正负可行性以执行和确定性验证为主。
 
-### 11.6 论文滑向纯系统工作
+### 11.6 研究范围滑向纯系统工作
 
-面向 ICLR 时，主线必须是：
+如果最终以机器学习论文组织，主线需要包含可验证的学习问题，而不能只实现一套插件系统：
 
 ```text
 新的学习问题
@@ -657,9 +867,9 @@ Cordis runtime 和配置系统作为语义与执行载体，而不是全文唯�
 
 ---
 
-## 12. 推荐的论文贡献结构
+## 12. 可能的研究贡献结构
 
-1. **Problem**：首次系统定义 Runtime-Conditioned Plugin Composition；
+1. **Problem**：明确界定 Runtime-Conditioned Plugin Composition，并通过文献与实验验证该定义是否必要；
 2. **Theory**：独立排序不充分、组合 NP-hard、contract/lifecycle 可行性；
 3. **Data**：PlugBench-Retrieve + PlugBench-Execute；
 4. **Generation**：forward execution、effect distillation、counterfactual environment、typed rejects；
