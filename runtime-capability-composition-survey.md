@@ -460,6 +460,548 @@ Koishi 的 4000 个插件已经验证了本文拟议模型。
 
 Koishi 案例只能说明这种组件抽象在一个 TypeScript 生态中被长期采用。论文也明确承认其证据是观察性案例，没有受控性能比较、开发效率评测或 Cordis v4 全部假设的生产验证。
 
+### 3.6 Cordis 的关键定义、假设与定理依赖
+
+本节尽量保留 Cordis 论文的定义结构，但改写成便于工程讨论的纯文本形式。编号 `D1`–`D12` 是本文为了引用方便添加的，不是原论文编号；括号中同时给出原论文的 Definition/Theorem 编号。
+
+#### 3.6.1 基础记号
+
+```text
+Γ：
+系统希望纳入动态组合边界的状态空间。
+
+γ ∈ Γ：
+某一时刻的具体系统状态。
+
+f : Γ -> Γ：
+一个正向状态变换。
+
+g : Γ -> Γ：
+与某次正向变换配对的 inverse。
+
+K：
+依赖或 capability keys 的集合。
+
+V_k：
+key k 对应的 value/interface 类型。
+
+≈ / ≃：
+观察等价关系；不要求底层物理表示完全一致。
+```
+
+#### 3.6.2 D1：Effect Context（原 Definition 2–7）
+
+论文首先把“当前状态”和“已经积累的撤销逻辑”放在一起：
+
+```text
+EffectContext(Γ) = Γ × (Γ -> Γ)
+```
+
+一个 Effect Context 写成：
+
+```text
+(γ, φ)
+
+γ：当前状态
+φ：inverse accumulator
+```
+
+初始状态：
+
+```text
+(γ0, identity)
+```
+
+对正向变换 `f` 和候选 inverse `g`，运行时跟踪操作是：
+
+```text
+track(f, g)(γ, φ)
+    = (f(γ), φ ∘ g)
+```
+
+恢复操作是：
+
+```text
+recover(γ, φ)
+    = (φ(γ), identity)
+```
+
+关键点不是单个 `g` 能撤销，而是 inverse 会随执行自动组合。若先执行 `f1` 再执行 `f2`，撤销时执行顺序必须反过来：
+
+```text
+forward： f1 -> f2
+inverse： g2 -> g1
+```
+
+#### 3.6.3 D2：Revertible Effect Function（原 Definition 8–16）
+
+实际系统通常无法提前为 `f` 固定一个适用于所有状态的 inverse，因此论文让 inverse 在 effect 应用时产生：
+
+```text
+e : Γ -> (Γ, Γ -> Γ)
+```
+
+在状态 `γ` 上：
+
+```text
+e(γ) = (δ, g)
+```
+
+含义：
+
+```text
+δ：执行 effect 后的新状态
+g：只需要对这次执行产生的 δ 正确
+```
+
+Witness 条件：
+
+```text
+g(δ) ≈ γ
+```
+
+这里是左逆要求：
+
+```text
+先执行 effect，再执行 inverse，可以恢复；
+不要求先执行 inverse，再执行 effect 有意义；
+也不要求 g 对所有可能状态都是 f 的全局逆。
+```
+
+两个 effect 的组合：
+
+```text
+先运行 e2：
+    e2(γ) = (δ, s)
+
+再运行 e1：
+    e1(δ) = (ε, t)
+
+组合结果：
+    (e1 ⋄ e2)(γ) = (ε, s ∘ t)
+```
+
+执行组合 inverse 时会先运行 `t`、再运行 `s`，即 LIFO。
+
+#### 3.6.4 D3：Effect Independence（原 Definition 17–21）
+
+仅有 LIFO 可以安全撤销一个组件内部的 effect 序列，但不能自动保证在多个组件交错执行后任意卸载其中一个。
+
+论文为 effect `e` 定义 transformation monoid：
+
+```text
+M(e) =
+由 e 的 forward map
++ e 在不同状态可能返回的所有 inverses
+生成的变换集合。
+```
+
+两个 effects `e1`、`e2` 独立，需要同时满足：
+
+```text
+1. M(e1) 中任一变换与 M(e2) 中任一变换可交换：
+
+   a ∘ b ≈ b ∘ a
+
+2. 另一个 effect 的变换不会改变当前 effect 会返回哪个 inverse：
+
+   inverse_of_e1(b(γ)) ≈ inverse_of_e1(γ)
+
+   反方向同样成立。
+```
+
+第二条比普通“最终状态可交换”更强，因为一个 effect 可能根据当前状态选择不同 disposer 或 continuation。
+
+这一定义在工程上对应：
+
+```text
+注册两个不同名称的无序工具：
+通常可能独立。
+
+向有序 middleware chain 插入两个处理器：
+通常不独立。
+
+修改同一个全局计数器：
+取决于 operation 和 observational equivalence。
+```
+
+论文后续的全局 recovery/confluence 结论依赖这种独立性，但 Cordis TypeScript 运行时不会自动证明它。
+
+#### 3.6.5 D4：Coeffect Context（原 Definition 22–24）
+
+依赖环境定义为带类型的有限 partial map：
+
+```text
+Σ = (k : K) ⇀ V_k
+```
+
+即：
+
+```text
+每个 key k 如果存在，
+其 value 必须属于对应类型 V_k。
+```
+
+基本操作：
+
+```text
+get(k)(σ) = σ(k)
+
+set(k, v)(σ)
+    = (
+        σ[k -> v],
+        inverse = 删除 k
+      )
+```
+
+因此“提供一个依赖”本身也是 revertible effect：
+
+```text
+注册 provider -> inverse 是撤销 provider。
+```
+
+论文进一步把一个 coeffect key 定义为三元组：
+
+```text
+Coeffect(k) = (
+    V_k,
+    equivalence_k,
+    operations_k
+)
+```
+
+- `V_k`：接口或 value 类型；
+- `equivalence_k`：通过该接口观察时，哪些内部状态视为相同；
+- `operations_k`：组件通过该 capability 可以执行的操作。
+
+这说明 capability 不只是一个任意对象引用，还应定义可观察行为和等价边界。
+
+#### 3.6.6 D5：Coeffect Specification 与通知（原 Definition 25–26）
+
+组件声明依赖集合：
+
+```text
+d ⊆ K
+```
+
+当前环境满足依赖：
+
+```text
+σ satisfies d
+    iff
+对每个 k ∈ d，k 都存在于 σ。
+```
+
+一次 Context 变化 `σ -> σ'`，针对组件 `d` 分类为：
+
+```text
+activating：
+    变化前不满足，变化后满足
+
+deactivating：
+    变化前满足，变化后不满足
+
+neutral：
+    其他情况
+```
+
+运行时行为：
+
+```text
+activating -> 执行组件 effects
+deactivating -> 执行 accumulator
+neutral -> 不切换生命周期
+```
+
+注意：该基础定义只检查 key presence。版本、权限、平台、资源预算等约束需要扩展 satisfaction predicate，不能假设原始 Cordis 定义已经覆盖。
+
+#### 3.6.7 D6：Isolation（原 Definition 27–29）
+
+为了让同一逻辑 key 在不同子 Context 中解析到不同 provider，论文引入 realm：
+
+```text
+IsolationContext = (
+    key_to_realm,
+    realm_to_value
+)
+```
+
+解析过程：
+
+```text
+key k
+  -> realm r = key_to_realm(k)
+  -> value = realm_to_value(r)
+```
+
+不同 Agent/session 可以让相同的 `filesystem`、`credentials`、`memory` key 指向不同实例。
+
+Isolation 通常通过派生 child Context 实现，不修改父 Context 的共享表。销毁 child Context 即可撤销这层解析，不需要额外 inverse。
+
+#### 3.6.8 D7：Interception（原 Definition 30–31）
+
+Interception 不改变：
+
+```text
+key 最终解析到哪个 provider
+```
+
+而是改变：
+
+```text
+调用 provider 时附加哪些 metadata / policy。
+```
+
+可以理解为：
+
+```text
+effective_metadata
+    = component_declared_metadata
+      merge
+      context_enforced_metadata
+```
+
+外层 Context 的约束可以覆盖组件声明，例如：
+
+```text
+filesystem path allowlist
+read-only database
+token / cost budget
+rate limit
+audit tag
+```
+
+这是一种 capability mediation，不是恶意代码沙箱。组件若能绕过 Context 直接调用宿主 API，interception 无法阻止。
+
+#### 3.6.9 D8：Unified Recursive Context（原 Definition 32）
+
+论文把 effect accumulator 和 coeffect table 统一成递归 Context：
+
+```text
+Context =
+    current_context_state
+    × inverse_accumulator
+    × coeffect_table
+```
+
+由于 `current_context_state` 自身也是 Context，因此结构可以递归形成父子树：
+
+```text
+root Context
+├── plugin A Context
+│   ├── plugin A1 Context
+│   └── plugin A2 Context
+└── plugin B Context
+```
+
+加载子组件是父 Context 上的 effect；卸载父组件会退休其子组件并回收它们的 effects。
+
+#### 3.6.10 D9：Observational Equivalence（原 Definition 33–42）
+
+物理状态通常无法逐字节恢复，例如：
+
+```text
+malloc 后 free，heap layout 不一定相同；
+删除随机生成的 handle 后，计数器可能已经前进。
+```
+
+论文不要求物理相等，而要求正式 coeffect operations 无法区分：
+
+```text
+σ ≃ σ'
+    iff
+两者包含相同 keys，
+且每个 key 上的 values 按 equivalence_k 等价。
+```
+
+因此“完全恢复”应准确表述为：
+
+```text
+恢复到系统正式观察接口下不可区分的状态。
+```
+
+选择什么 observation interface 会直接决定什么可以被称为恢复。Benchmark 如果只比较文件摘要，就不能据此声称进程、网络或外部数据库状态也已恢复。
+
+#### 3.6.11 D10：Component（原 Definition 43）
+
+组件定义为：
+
+```text
+Component = (
+    d,
+    p,
+    e
+)
+```
+
+其中：
+
+```text
+d：requires / coeffect specification
+p：可能提供的 capability keys
+e：带 witness 的 effect function / iterator
+```
+
+这与本文 Plugin Contract 的最小核心一致，但本文还需要补充 descriptor、版本、平台、权限、配置和成本，才能支持检索与现实部署。
+
+#### 3.6.12 D11：Fiber、Registry 与 Target View（原 Definition 44–50）
+
+Fiber 是 Component 的一次实例化，包含：
+
+```text
+requires d
+provides p
+effect e
+parent π
+local coeffect table σ
+retirement flag τ
+lifecycle state θ
+accumulator g
+committed view ω
+```
+
+`committed view` 记录组件激活时每个依赖实际绑定到哪个 provider identity。
+
+`target view` 表示当前环境下它应该绑定到谁：
+
+```text
+如果组件已退休：
+    target = inactive
+
+如果任何 dependency 不满足：
+    target = inactive
+
+否则：
+    target = {
+        dependency key -> current provider fiber id
+    }
+```
+
+生命周期由 `committed view` 与 `target view` 是否一致驱动：
+
+```text
+没有 committed view，但 target 可用：
+    开始 activation
+
+committed view 与 target 不同：
+    开始 deactivation，之后按新 target 重载
+```
+
+记录 provider identity 而不是仅比较 provider value，保证“新旧 provider 返回相等对象”仍会被识别为 provider replacement。
+
+#### 3.6.13 D12：Effect Iterator 与完整生命周期（原 Definition 49–53）
+
+现实 activation 不是一个原子步骤。论文使用 effect iterator，让每个步骤返回：
+
+```text
+new_state
+inverse_for_this_step
+optional_continuation
+```
+
+完整 lifecycle states：
+
+```text
+INACTIVE
+LOADING / RELOADING
+ACTIVE
+UNLOADING
+```
+
+十类 operational rules：
+
+| 类别 | Rule | 含义 |
+|---|---|---|
+| Orchestration | O-Insert | 注册一个新 Fiber |
+| Orchestration | O-Retire | 请求 Fiber 退出 |
+| Orchestration | O-Remove | Fiber 完全 inactive 后删除记录 |
+| Activation | L-Begin | 依赖满足后开始加载 |
+| Activation | L-Iter | 执行一个 effect step 并累计 inverse |
+| Activation | L-Finish | effect iterator 完成，进入 ACTIVE |
+| Activation abort | L-Divert | target 变化，转入回滚 |
+| Activation failure | L-Raise | effect 报错，转入回滚并记录错误 |
+| Deactivation | L-Leave | 停止向新 consumer 提供服务 |
+| Deactivation | L-Unload | dependents 排空后执行 accumulator |
+
+异步步骤具有 inertia：
+
+```text
+一旦启动，不能假设它可以瞬间取消；
+即使依赖在执行中变化，也要让当前步骤落地，
+拿到 inverse 后再回滚。
+```
+
+#### 3.6.14 形式结论的假设矩阵
+
+| 结论 | 原论文编号 | 关键假设 | 能支持的工程表述 | 不能推出 |
+|---|---:|---|---|---|
+| Registry Preservation | Theorem 59 | 每步遵守 calculus rules，registry 初始良构 | 生命周期转换不产生悬空 parent/provider 引用 | 任意手写插件代码都不会破坏 registry |
+| Recovery Exactness | Theorem 61 | effects pairwise independent；inverse witness 成立 | 卸载一个 Fiber 只撤销它自己的贡献 | 非交换共享状态也能任意顺序卸载 |
+| Terminal Recovery | Corollary 62 | 同上；episode 正常结束、转向或失败后执行 accumulator | 部分加载失败不会保留已跟踪 effects | 未经 Context 的外部 effects 会被回收 |
+| Provider/Consumer Ordering | Theorem 63 | committed view、withdrawal guard、依赖解析合法 | provider 先启动后退出；consumer teardown 期间仍可读旧 binding | 网络 provider 永不失效或 teardown 一定及时完成 |
+| Resolution Coherence | Theorem 64 | target view 检查、iterator boundaries、landing 后回滚 | 一次 activation 不会把两组 dependency resolution 混合为成功状态 | 异步步骤可以无条件取消 |
+| Progress | Theorem 66 | dependency precedence 无环；Fiber 集有限；iterator 长度有界 | 生命周期不会因依赖排空协议永久无规则可走 | 外部 Future 一定返回；真实程序不会无限生成子组件 |
+| Confluence | Theorem 73 | pairwise independence；total provision；无 failed Fiber；达到 quiescence | 最终稳定状态等价于按最终配置重新装配 | 失败调度、外部 emissions 或中间可见轨迹都相同 |
+
+#### 3.6.15 全局假设清单
+
+后续如果引用 Cordis 作为理论依据，至少需要逐项声明：
+
+| 假设 | 含义 | 在数据/系统中如何检查 |
+|---|---|---|
+| A1 Context boundary | 所有需要保证的共享交互经 Context | 静态扫描、API wrapper、sandbox syscall/trace |
+| A2 Correct inverse | 每个 atomic effect 的 disposer 能恢复该次 effect | property test、故障注入、前后状态比较 |
+| A3 Confinement | 组件只读已声明 coeffects，只写自己的 state/provisions | capability mediation、scope audit |
+| A4 Provision discipline | provider identity 和 key/realm 关系合法 | contract validator |
+| A5 Effect independence | 跨组件正向和逆向变换可交换，inverse 选择稳定 | pairwise execution test；无法证明时显式排序 |
+| A6 Acyclic precedence | dependency ordering 无环 | graph cycle detection |
+| A7 Finiteness | Fiber 集和每次 effect iterator 有界 | task/plugin budget、depth limit |
+| A8 Total provision | ACTIVE 组件实际提供其声明的全部 keys | post-activation contract check |
+| A9 No failed Fiber | confluence 结论排除最终 failed Fiber | health check、failure-aware metric |
+| A10 Defined equivalence | 明确哪些 observable states 必须恢复 | benchmark state schema、hash/checkpoint |
+| A11 External emission policy | 不可逆外部操作被延迟、幂等化或补偿 | outbox、idempotency、approval、compensation log |
+| A12 Runtime termination | teardown/future 有 timeout 与隔离策略 | deadline、kill boundary、sandbox reset |
+
+其中 A12 是现实系统补充要求，不是论文 Progress 定理自动提供的保证。论文抽象假设异步步骤最终落地；真实网络调用可能永久挂起。
+
+#### 3.6.16 从定义到本文任务变量
+
+```text
+Cordis Γ / Context
+    -> 本文 (E, H)
+
+Cordis Component
+    -> Plugin Contract
+
+Cordis Fiber registry
+    -> current active plugin graph
+
+Cordis target view
+    -> verifier 对候选 ΔH 计算的期望 provider bindings
+
+Cordis lifecycle trace
+    -> activation/disposal supervision
+
+Cordis observational equivalence
+    -> Reversible Task Success 的 final-state 判定
+```
+
+这一映射需要通过实现和数据验证，不能只凭符号相似就认定成立。
+
+#### 3.6.17 对研究问题的可证伪要求
+
+加入 Cordis 定义后，本文至少应回答以下经验问题：
+
+1. 现实 MCP/Koishi/Harness 插件能否抽取出足够完整的 `requires/provides/effect/disposer`；
+2. 多数任务的环境变化是否真的改变最优 Plugin Plan，还是简单规则已经足够；
+3. 独立 retriever 的错误是否主要来自集合冲突，而不是描述质量差；
+4. contract verifier 是否能预测实际 activation failure；
+5. disposer/state restoration 是否可稳定测量；
+6. 使用生命周期监督是否提高任务完成率，还是只增加系统复杂度；
+7. Cordis 的独立性、无环和 total provision 假设在真实插件中有多大比例成立。
+
+如果这些问题的实证结果不支持假设，应缩小问题范围，而不是用理论定义替代实验。
+
 ---
 
 ## 4. 方法草案：State-Conditioned Plugin Composer
