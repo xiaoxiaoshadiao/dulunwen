@@ -1289,7 +1289,7 @@ task_failed
 | Official MCP Registry | server name/title/description/version/package/transport/env/auth/repository | https://registry.modelcontextprotocol.io/ | 主要真实 Plugin Catalog |
 | MCP Registry API | `/v0.1/servers`、版本详情、增量同步 | https://github.com/modelcontextprotocol/registry/blob/main/docs/reference/api/official-registry-api.md | 可做可重复抓取 |
 | MCP `server.json` schema | package、transport、env variables、remote URL、repository | https://github.com/modelcontextprotocol/registry/blob/main/docs/reference/server-json/generic-server-json.md | 统一 Plugin manifest 的初始来源 |
-| Koishi Plugin Registry | npm package、版本、描述、manifest、publisher 等 | https://registry.koishi.chat/index.json | 官方入口会重定向到带哈希的最新索引；真实 Cordis 插件生态，任务标签缺失 |
+| Koishi Plugin Registry mirror | npm package、版本、描述、manifest、publisher 等 | https://koishi-shangxue-plugins.github.io/koishi-registry-aggregator/market.json | 官方 `registry.koishi.chat/index.json` 当前不稳定；镜像同步官方索引。真实 Cordis 插件生态，任务标签缺失 |
 | Koishi registry code | Registry 更新和部署逻辑 | https://github.com/koishi-actions/registry | 用于理解抓取与许可 |
 | DeepSeek Harness | 230+ workspace packages；Cordis config/bundles/contracts | https://github.com/deepseek-ai/deepseek-harness | 最贴近 Harness Plugin，但目录规模较小 |
 | dsh plugin topic | 社区 Harness 插件发现入口 | https://github.com/topics/dsh-plugin | 当前数量和质量需要后续抓取 |
