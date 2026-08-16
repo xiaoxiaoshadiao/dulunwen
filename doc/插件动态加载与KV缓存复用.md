@@ -169,3 +169,134 @@ packages/bundle
 6. 子Agent隔离。
 
 每组记录模型请求的Token序列摘要、缓存命中、Prefill、延迟、Tool选择和任务成功率。第一轮目标不是训练新模型，而是确认插件动态加载在DeepSeek Harness中到底如何影响模型输入和KV Cache。
+
+## 十、源码初步结论
+
+当前源码与官方`master`提交`47f943859bef60e4160492346772ded9b24f765a`逐文件一致。第一轮阅读已经确认以下行为。
+
+### 10.1 System Prompt与Tool Schema统一组装
+
+`packages/core/system-prompt`维护Sections、动态Context、Tool Schema和Prompt变量。Tool Registry不是由Agent Loop单独查询，而是向System Prompt服务注册一个Tool Provider。每次组装同时得到：
+
+```text
+PromptAssembly = {
+  sections,
+  contexts,
+  tools,
+  variables
+}
+```
+
+插件可以通过同一个`system-prompt/assemble`过程同时修改System Prompt和模型可见Tools。源码还会对Tools采用配置顺序或按名称排序，减少相同Tool集合因为注册顺序不同而产生的请求差异。
+
+相关位置：
+
+```text
+packages/core/system-prompt/src/index.ts
+packages/core/tools/src/index.ts
+```
+
+### 10.2 每个Step生成一份冻结请求
+
+Agent Loop在每个Step开始前执行Prompt Assembly，再使用本次的`system`、`tools`和`session.deriveMessages()`构造请求。请求在发送前执行深冻结，因此当前Step使用的是一份固定视图，插件变化应在后续Step重新组装时体现。
+
+当System Prompt、Tool Schema、模型或请求配置发生变化时，Agent Loop会写入新的`request/header`事件。Header包含完整的System Prompt和Tool Schema，可用于恢复和审计某个Step实际看到的模型输入。
+
+相关位置：
+
+```text
+packages/core/agent-loop/src/agent.ts
+packages/core/session
+```
+
+### 10.3 DeepSeek请求中的实际顺序
+
+DeepSeek Adapter将System Prompt放入第一条`system`消息，随后序列化Session Messages；Tool Schema通过Chat Completions请求的独立`tools`字段发送：
+
+```text
+request = {
+  model,
+  messages: [system, ...history],
+  tools,
+  stream: true
+}
+```
+
+虽然Tools在协议中不是普通消息，但仓库的设计记录明确将Tool Schema视为模型请求前缀的一部分。改变或省略Tools会破坏后续Token与已有缓存的对齐。
+
+相关位置：
+
+```text
+packages/llm/llm-deepseek/src/serialize.ts
+.agents/notes/archived/architecture/2026-06-11-tool-schemas-in-prompt-assembly.zh.md
+```
+
+### 10.4 DeepSeek缓存命中统计
+
+DeepSeek返回的`prompt_tokens`包含命中和未命中的输入Token。Adapter按以下方式转换：
+
+```text
+cacheReadTokens =
+  prompt_tokens_details.cached_tokens
+  或 prompt_cache_hit_tokens
+
+inputTokens =
+  prompt_tokens - cacheReadTokens
+```
+
+Harness中的`inputTokens`表示未缓存输入，`cacheReadTokens`单独统计命中部分。Token Meter会把二者分别累计，因此可以直接用于后续缓存实验。当前DeepSeek映射没有提供`cacheWriteTokens`。
+
+相关位置：
+
+```text
+packages/llm/llm-deepseek/src/translate.ts
+packages/llm/llm/src/types.ts
+packages/llm/token-meter/src/usage-projection.ts
+```
+
+### 10.5 Skill目录采用追加式替换
+
+`tool-skill`会在每次`agent/pre-step`重新获取Skill目录，对Skill名称和描述计算Digest。目录变化时，不修改历史消息，而是追加一条完整替换目录；Skill全部消失时追加空目录，明确禁止使用旧名称。
+
+这种设计保留较早的可复用前缀，但有两个代价：
+
+- 每次目录变化都要追加完整目录，Token成本与当前目录大小相关；
+- 已经通过`skill`工具加载的Skill正文作为Tool Result留在History中，不会因为目录移除而自动消失。
+
+相关位置：
+
+```text
+packages/skill/tool-skill/src/index.ts
+.agents/notes/implemented/feature/2026-07-27-skill-catalog-hot-refresh.zh.md
+```
+
+### 10.6 Compaction已经专门优化KV Cache
+
+旧Compaction使用新的摘要System Prompt和扁平Transcript，导致从第一个Token起就无法复用刚刚预热的对话缓存。当前实现改为：
+
+```text
+原请求System Prompt
++ 原请求Tool Schema
++ 原始History前缀
++ 末尾Compaction指令
+```
+
+即使摘要调用不会执行工具，也必须带上原Tool Schema，否则Token序列会从Tools位置开始失去对齐。这一设计直接证明Tool Schema稳定性已经被DeepSeek Harness视为KV Cache问题，而不只是Tool Calling问题。
+
+相关记录：
+
+```text
+.agents/notes/implemented/bug-fix/2026-07-21-compaction-summary-prefix-cache-reuse.zh.md
+```
+
+### 10.7 当前尚未确认
+
+下一轮源码需要继续确认：
+
+1. Plugin卸载后，已加载Skill正文和其他历史说明何时退出模型可见History；
+2. 标准模式动态增删Tool时，实际Cache Hit下降多少；
+3. PTC/Code Mode是否只暴露稳定的`run_code`Schema；
+4. Agent Preset切换是否复用同一个Session和Request Header；
+5. Tool Registry变化与正在执行的Tool Call之间如何隔离；
+6. Provider侧Prefix Cache是否把独立`tools`字段按什么顺序编码；
+7. Tool Schema的JSON规范化是否保证跨进程字节级稳定。
