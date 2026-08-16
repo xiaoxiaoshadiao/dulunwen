@@ -1,8 +1,8 @@
 # DeepSeek Harness简短调研
 
-> **这次调研不只是介绍DeepSeek Harness有哪些模块，而是想回答：插件化Harness如何改变模型看到的能力，以及这种动态变化会怎样影响Tool调用、上下文和KV Cache。**
+> **DeepSeek Harness把Agent需要的上下文、工具、状态和执行能力拆成了可组合的插件。我们看源码时重点关注：插件变化以后，模型输入、Tool执行和KV Cache会发生什么。**
 
-## 一、DeepSeek Harness是什么
+## 一、先看DeepSeek Harness在干什么
 
 DeepSeek Harness不是模型，而是模型外部的Agent运行框架。它负责组装上下文、暴露Tools、执行操作、保存Session，并管理权限、取消、恢复和子Agent。
 
@@ -17,15 +17,13 @@ DeepSeek Harness不是模型，而是模型外部的Agent运行框架。它负�
 
 它基于Cordis实现“一切皆插件”。Agent Loop、Tools、Skill、文件系统、Shell、模型适配器和界面都可以由插件注册并通过配置组合。
 
-## 二、我们真正关心的五个问题
+## 二、看源码时主要盯了五个问题
 
 1. Plugin和Tool到底是什么关系，模型调用的是谁？
 2. Tool为什么要排序，排序能否保证KV Cache稳定？
 3. Native Mode和Code Mode有什么区别？
 4. 插件在模型请求期间加载或卸载，会不会出现状态不一致？
 5. Plugin已经卸载后，模型看过的Prompt和Skill是否真的消失？
-
-下面的内容围绕这五个问题展开。
 
 ## 三、Plugin和Tool是什么关系
 
@@ -143,7 +141,7 @@ System Prompt和Tool Schema可以在下一Step重新组装时删除，但会改�
 
 Sub-Agent提供了更清楚的作用域：任务相关Plugin、Prompt、Tools和History都放在独立Session中，任务结束后整体关闭，只把最终结果返回主Agent。但它也会增加新的Prefill和父子通信成本。
 
-## 八、源码中已经确认的设计
+## 八、源码给出的答案
 
 - System Prompt和Tool Schema由同一套Prompt Assembly组装；
 - Tools采用确定性排序；
@@ -154,7 +152,7 @@ Sub-Agent提供了更清楚的作用域：任务相关Plugin、Prompt、Tools和
 - Code Mode原生只暴露`run_code`，但完整Tools SDK仍在System Prompt中；
 - Skill和Runtime Context变化采用追加式完整替换。
 
-## 九、我们的判断
+## 九、最后怎么看
 
 DeepSeek Harness已经把Plugin、Tool、Prompt、Session和缓存问题连接在一起。它说明能力检索不能只优化“找得准不准”，还要考虑：
 
