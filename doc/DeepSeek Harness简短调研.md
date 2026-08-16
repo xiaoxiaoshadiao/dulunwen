@@ -1,78 +1,35 @@
 # DeepSeek Harness简短调研
 
-> **DeepSeek Harness不是一个新模型，而是一套让模型能够读取文件、调用工具、运行任务、管理状态并组合插件的Agent运行框架。**
+> **这次调研不只是介绍DeepSeek Harness有哪些模块，而是想回答：插件化Harness如何改变模型看到的能力，以及这种动态变化会怎样影响Tool调用、上下文和KV Cache。**
 
-## 一、它解决什么问题
+## 一、DeepSeek Harness是什么
 
-模型本身只负责根据输入生成输出。一个可以真正工作的Agent还需要：
-
-- 组织System Prompt和上下文；
-- 向模型暴露Tools；
-- 执行Tool Call并返回结果；
-- 保存Session和任务状态；
-- 管理文件、终端、网页和子Agent；
-- 控制权限、超时、取消和恢复。
-
-DeepSeek Harness将这些能力拆成插件，通过配置组合成Web、终端、Headless或自动化服务。当前源码版本为`0.1.0-rc.5`，仍处于开发者预览阶段。
-
-## 二、整体架构
-
-```text
-Web / TUI / Headless / SDK
-              ↓
-          Agent Loop
-              ↓
-System Prompt + Tools + Session
-              ↓
-          LLM Adapter
-              ↓
-   Tool执行 / 文件 / Shell / Web
-              ↓
-          Session Log
-```
-
-|模块|作用|
-|---|---|
-|Agent Loop|驱动模型请求和Tool执行|
-|System Prompt|组装Prompt、动态Context和Tool Schema|
-|Tools|注册、限制和执行模型可调用能力|
-|LLM Adapter|连接DeepSeek等模型服务|
-|Session|记录消息、请求配置、Tool结果和状态变化|
-|Skill|按需加载程序性说明|
-|Preset/Bundle|组合一组插件，形成不同Agent形态|
-|Cordis|管理插件作用域、依赖、加载和卸载|
-
-## 三、一次任务如何运行
+DeepSeek Harness不是模型，而是模型外部的Agent运行框架。它负责组装上下文、暴露Tools、执行操作、保存Session，并管理权限、取消、恢复和子Agent。
 
 ```text
 用户输入
-→ 开始Turn
-→ 组装当前System Prompt和Tools
-→ 从Session Log生成History
-→ 构造并冻结模型请求
-→ 模型返回文本或Tool Call
-→ Harness执行Tool
-→ Tool结果写入Session
-→ 如有需要进入下一Step
+→ Agent Loop
+→ System Prompt + Tools + Session
+→ DeepSeek模型
+→ Tool Call
+→ Harness执行Tool并记录结果
 ```
 
-一个Turn可以包含多个Step。每个Step只进行一次模型请求，并执行该请求产生的Tool Calls。
+它基于Cordis实现“一切皆插件”。Agent Loop、Tools、Skill、文件系统、Shell、模型适配器和界面都可以由插件注册并通过配置组合。
 
-## 四、为什么说“一切皆插件”
+## 二、我们真正关心的五个问题
 
-Plugin是Harness中的运行时模块。它可以注册：
+1. Plugin和Tool到底是什么关系，模型调用的是谁？
+2. Tool为什么要排序，排序能否保证KV Cache稳定？
+3. Native Mode和Code Mode有什么区别？
+4. 插件在模型请求期间加载或卸载，会不会出现状态不一致？
+5. Plugin已经卸载后，模型看过的Prompt和Skill是否真的消失？
 
-```text
-Tool
-System Prompt
-Skill
-Service
-后台任务
-权限策略
-模型或存储实现
-```
+下面的内容围绕这五个问题展开。
 
-模型通常调用Tool，而不是直接调用Plugin：
+## 三、Plugin和Tool是什么关系
+
+Plugin是运行时模块，可以注册Tool、Prompt、Skill、Service、后台任务或模型实现。Tool是Plugin向模型暴露的一种具体能力。
 
 ```text
 Plugin加载
@@ -82,48 +39,135 @@ Plugin加载
 → Harness执行Plugin提供的函数
 ```
 
-Plugin决定Agent拥有哪些能力，Tool是模型使用能力的具体接口。
+**模型通常调用Tool，不直接调用Plugin。** Plugin决定Agent拥有哪些能力，Tool负责具体执行。
 
-## 五、源码中与模型输入有关的设计
-
-第一轮源码阅读确认：
-
-- System Prompt和Tool Schema由同一套Prompt Assembly组装；
-- Tools采用确定性排序，避免同一集合因为注册顺序不同而改变请求；
-- 每个Step生成并冻结一份模型请求；
-- Session Log记录模型可见消息和完整请求Header；
-- DeepSeek Adapter可以统计未缓存输入和缓存命中Token；
-- Compaction会复用原System Prompt、Tools和History前缀。
-
-这些设计说明Harness不仅关心工具能否调用，也在考虑请求是否稳定、能否回放以及能否复用KV Cache。
-
-## 六、插件动态加载与KV Cache
-
-一次模型请求可以简化为：
+我们后续所说的Plugin Retrieval，发生在Tool Call之前：
 
 ```text
-System Prompt
-+ Tool Schema
-+ History
-+ 当前输入
+先选择并加载Plugin
+→ Plugin注册Tools
+→ 模型再选择和调用Tools
 ```
 
-KV Cache依赖相同Token前缀。插件新增或删除Tool时，Tool Schema变化，变化位置之后的History可能需要重新Prefill。
+## 四、Tool排序与KV Cache
 
-|模式|模型如何使用Tools|缓存特点|
+KV Cache依赖请求Token前缀完全一致。相同Tool集合如果因为并发加载顺序不同，分别生成：
+
+```text
+[A, B, C]
+[B, A, C]
+```
+
+模型请求也会不同。DeepSeek Harness按名称或配置顺序排列Tools，使同一集合稳定生成同一顺序。
+
+但排序只能解决**同一集合顺序不稳定**，不能解决**Tool集合发生变化**：
+
+```text
+旧：[A, C, D]
+新：[A, B, C, D]
+```
+
+新增B后，从B的位置开始发生分叉，后面的Tools和History仍可能需要重新Prefill。
+
+> **排序保证确定性，不保证动态增删Tool时KV Cache不变。**
+
+## 五、Native Mode和Code Mode
+
+|模式|原生Tool Schema|模型如何使用真实Tools|
 |---|---|---|
-|Native|模型直接调用全部真实Tools|Tool Schema变化会改变请求|
-|Code|模型调用`run_code`，代码再调用Tools|原生Schema稳定，但完整Tools SDK仍在System Prompt|
-|Both|同时支持Native和Code|能力重复表示，模型输入通常最大|
+|Native|全部真实Tools|模型直接生成Tool Call|
+|Code|只有`run_code`|模型写代码，代码调用Tools|
+|Both|真实Tools+`run_code`|两种方式都可用|
 
-Code Mode并没有让真实Tools消失。它的主要价值可能是一次代码执行组合多个Tools，减少模型往返和中间History，而不是彻底解决动态Tool带来的Cache变化。
+Code Mode看起来只暴露一个`run_code`，但真实Tools会被渲染成SDK文本放进System Prompt：
 
-## 七、与我们当前工作的关系
+```text
+System Prompt + 完整Tools SDK
+Native Tools = [run_code]
+```
 
-我们关心的是智能体如何从大量候选中发现、组织和执行能力。DeepSeek Harness提供了一个真实的插件化运行框架，也暴露了一个值得继续研究的问题：
+因此动态Tool变化仍会修改System Prompt，Code Mode并没有让KV Cache问题消失。
 
-> 动态检索更少的Plugins和Tools可以减少模型输入，但频繁改变能力集合也会降低KV Cache复用，并增加加载、执行和卸载成本。
+Code Mode真正可能节省的是：
 
-下一步不是立即训练新模型，而是先比较不同能力暴露方式在任务成功率、Tool数量、Prefill、Cache Hit和延迟上的实际差异。
+- 一段代码可以连续调用多个Tools；
+- 中间Tool Result不必全部进入模型History；
+- 模型与Harness的往返次数可能更少。
 
-更完整的源码链路、Session/Skill卸载、Preset/Sub-Agent和实验设计见《DeepSeek Harness完整调研》。
+所以Native和Code应该比较**整个任务的总成本和成功率**，而不是只比较一次请求的Tool Schema长度。
+
+## 六、模型视图与执行状态的竞态
+
+DeepSeek Harness在每个Step开始时组装System Prompt和Tool Schema，并冻结当前模型请求。插件在Assembly之后变化，通常到下一Step才会进入模型视图。
+
+但模型生成Tool Call后，Harness执行前会再次查询实时Tool Registry：
+
+```text
+模型请求中存在web_search
+→ 模型生成web_search调用
+→ Plugin在执行前被卸载
+→ 实时Registry找不到Tool
+→ UNKNOWN_TOOL
+```
+
+因此：
+
+```text
+模型看到的Tool Schema：按Step冻结
+真正执行的Tool Registry：仍然动态
+```
+
+两者之间存在短暂竞态。可能的处理方式包括阶段内固定Plugin Set、为Plugin增加执行租约，或允许失败后在下一Step重新规划。
+
+## 七、卸载不等于模型忘记
+
+Plugin卸载包含三个层次：
+
+|层次|含义|当前情况|
+|---|---|---|
+|执行层|Tool、Service和进程不能再执行|可以通过Disposer完成|
+|发现层|下一Step不再展示Tool或Skill|可以完成|
+|上下文层|模型不再看到旧Prompt和Skill正文|不能自动完成|
+
+System Prompt和Tool Schema可以在下一Step重新组装时删除，但会改变请求前缀。Skill目录为了保持Append-only，会追加一条新目录声明旧目录失效；已经加载的Skill正文仍留在History，直到Compaction将其遮蔽。
+
+这里存在一个实际取舍：
+
+```text
+真正删除旧上下文
+→ 语义干净，但Cache失效较多
+
+追加失效通知
+→ Cache友好，但模型仍然看过旧信息
+```
+
+Sub-Agent提供了更清楚的作用域：任务相关Plugin、Prompt、Tools和History都放在独立Session中，任务结束后整体关闭，只把最终结果返回主Agent。但它也会增加新的Prefill和父子通信成本。
+
+## 八、源码中已经确认的设计
+
+- System Prompt和Tool Schema由同一套Prompt Assembly组装；
+- Tools采用确定性排序；
+- 每个Step生成并冻结一份模型请求；
+- Session Log保存消息和完整请求Header；
+- DeepSeek Adapter可以读取`cacheReadTokens`；
+- Compaction会复用原System、Tools和History头部；
+- Code Mode原生只暴露`run_code`，但完整Tools SDK仍在System Prompt中；
+- Skill和Runtime Context变化采用追加式完整替换。
+
+## 九、我们的判断
+
+DeepSeek Harness已经把Plugin、Tool、Prompt、Session和缓存问题连接在一起。它说明能力检索不能只优化“找得准不准”，还要考虑：
+
+```text
+暴露多少能力
+能力集合变化多频繁
+模型请求需要重新Prefill多少
+执行状态是否和模型视图一致
+任务结束后能否清理运行时和上下文
+```
+
+当前最值得验证的方案是：**任务阶段开始时选择并加载一组Plugins，阶段内保持稳定，阶段完成后统一卸载。**
+
+下一步实验只需要先比较Native动态Tools、Code动态SDK和阶段内固定Plugin Set在Cache Hit、TTFT、任务成功率和无效Tool Call上的差异。
+
+更完整的架构、源码链路和实验设计见《DeepSeek Harness完整调研》。
