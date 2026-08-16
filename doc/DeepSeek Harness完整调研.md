@@ -1,8 +1,57 @@
-# 插件动态加载、模型可见状态与KV Cache复用
+# DeepSeek Harness完整调研
 
-> 本文记录插件动态加载对System Prompt、Tool Schema和KV Cache的影响。当前内容是问题分析与源码阅读提纲，涉及DeepSeek Harness具体行为的部分仍需结合源码确认。
+> 本文从DeepSeek Harness整体架构开始，逐层进入Agent Loop、System Prompt、Tool、Session、Skill、Preset、Sub-Agent和KV Cache。源码快照与官方`master`提交`47f943859bef60e4160492346772ded9b24f765a`逐文件一致。
 
-## 一、问题定义
+## 一、DeepSeek Harness是什么
+
+DeepSeek Harness不是模型，而是围绕模型运行Agent任务的框架。模型负责生成文本或Tool Call，Harness负责准备上下文、暴露能力、执行操作、记录状态以及处理权限和恢复。
+
+它采用Cordis插件架构。Agent Loop、LLM Adapter、Tools、Session、文件系统、Shell、Skill、Sub-Agent、Preset和界面均由插件提供，通过Profile和Bundle组合成不同产品形态。当前源码版本为`0.1.0-rc.5`，仍处于开发者预览阶段。
+
+## 二、整体架构
+
+```text
+Web / TUI / Headless / SDK
+              ↓
+        Agent与Session管理
+              ↓
+           Agent Loop
+              ↓
+System Prompt / Tools / Session / LLM
+              ↓
+文件 / Shell / Web / Skill / Sub-Agent
+              ↓
+          Cordis Context
+```
+
+|层次|主要职责|代表目录|
+|---|---|---|
+|入口层|Web、终端、Headless和自动化协议|`apps/`、`packages/acp`、`packages/sdk`|
+|控制层|Turn、Step、请求和Tool执行|`packages/core/agent-loop`|
+|模型输入层|System Prompt、Tools和Session History|`packages/core/system-prompt`、`packages/core/tools`、`packages/core/session`|
+|模型连接层|Provider路由、请求序列化和Usage|`packages/llm`|
+|能力层|文件、Shell、Web、Skill、Sub-Agent和Workflow|`packages/fs`、`packages/shell`、`packages/web`、`packages/skill`、`packages/subagent`|
+|组合层|插件作用域、依赖、加载和卸载|`vendor/cordis`、`packages/preset`、`packages/bundle`|
+
+## 三、一次任务如何运行
+
+一次用户输入开启一个Turn，一个Turn可以包含多个Step。一个Step对应一次模型请求以及该请求产生的Tool执行。
+
+```text
+用户输入
+→ Inbox接收消息
+→ 组装System Prompt和Tool Schema
+→ 从Session Log生成History
+→ 构造并冻结模型请求
+→ LLM Adapter调用模型
+→ 模型返回文本或Tool Call
+→ Harness执行Tool并记录结果
+→ 如仍需模型处理，进入下一Step
+```
+
+Session Log是请求重建的事实来源。用户消息、模型回复和Tool结果进入模型History；System Prompt和Tool Schema记录在`request/header`中。后续章节讨论插件变化如何修改这些内容，以及修改后对KV Cache产生什么影响。
+
+## 四、问题定义
 
 插件加载不仅改变程序运行时，也可能改变模型每轮请求看到的内容。对第`t`轮请求，可以抽象为：
 
@@ -21,7 +70,7 @@ X_t = SystemPrompt(P_t) + ToolSchemas(P_t) + History_t + UserInput_t
 
 因此，插件检索减少了每轮暴露的能力数量，但如果插件集合频繁变化，也可能降低KV Cache复用率。两者之间存在实际权衡。
 
-## 二、不同变化对KV Cache的影响
+## 五、不同变化对KV Cache的影响
 
 |插件变化|模型可见输入|缓存影响|
 |---|---|---|
@@ -34,7 +83,7 @@ X_t = SystemPrompt(P_t) + ToolSchemas(P_t) + History_t + UserInput_t
 
 这里需要通过DeepSeek的模型适配层确认：Tool Schema最终如何序列化、处于System Prompt之前还是之后、是否参与Prefix Cache Key，以及缓存命中Token如何统计。
 
-## 三、正确性问题
+## 六、正确性问题
 
 动态插件系统需要同时维护两份状态：
 
@@ -57,13 +106,13 @@ X_t = SystemPrompt(P_t) + ToolSchemas(P_t) + History_t + UserInput_t
 
 还需要保证Tool Schema的顺序和序列化稳定。相同插件集合如果因为注册顺序、JSON字段顺序或默认值展开方式不同而产生不同Token，也会降低缓存命中。
 
-## 四、插件加载与卸载
+## 七、插件加载与卸载
 
-### 4.1 加载
+### 7.1 加载
 
 插件加载后，模型需要知道新增能力。直接加入System Prompt或Tool Schema最自然，但会修改请求前缀。若一个任务需要多轮调用，只要插件集合在加载后保持稳定，这次缓存失效可以被后续轮次摊销。
 
-### 4.2 卸载
+### 7.2 卸载
 
 卸载比加载复杂，因为模型可能已经在History中看过插件说明。
 
@@ -80,7 +129,7 @@ X_t = SystemPrompt(P_t) + ToolSchemas(P_t) + History_t + UserInput_t
 - Runtime是否仍接受旧Tool Call；
 - 日志回放时如何重建当时的模型视图。
 
-## 五、几种插件暴露方式
+## 八、几种插件暴露方式
 
 |方案|做法|优点|代价|
 |---|---|---|---|
@@ -93,7 +142,7 @@ X_t = SystemPrompt(P_t) + ToolSchemas(P_t) + History_t + UserInput_t
 
 DeepSeek Harness同时存在普通Tool模式、PTC/Code Mode、Skill和子Agent，因此比较这些模式对缓存、成功率和成本的影响具有现实意义。
 
-## 六、插件检索需要考虑缓存成本
+## 九、插件检索需要考虑缓存成本
 
 插件选择通常考虑相关性、依赖、权限和执行成本。动态加载后还应考虑：
 
@@ -112,7 +161,7 @@ DeepSeek Harness同时存在普通Tool模式、PTC/Code Mode、Skill和子Agent�
 
 这里不急于确定最终优化公式，需要先确认DeepSeek Harness的请求构造和DeepSeek模型服务的缓存统计方式。
 
-## 七、需要观察的指标
+## 十、需要观察的指标
 
 |类别|指标|
 |---|---|
@@ -125,7 +174,7 @@ DeepSeek Harness同时存在普通Tool模式、PTC/Code Mode、Skill和子Agent�
 
 只比较Input Token数量不够。需要同时报告缓存命中、Prefill、插件切换次数和任务成功率。
 
-## 八、DeepSeek Harness源码阅读范围
+## 十一、DeepSeek Harness源码阅读范围
 
 本轮源码分析围绕：
 
@@ -161,24 +210,11 @@ apps/cli
 
 实际调用链和结论记录在第十至十四节。
 
-## 九、第一轮实验设想
-
-可以固定同一个模型和任务，对比：
-
-1. 全量静态Tool Schema；
-2. 每轮动态增删Tool Schema；
-3. 任务阶段内固定Plugin Set；
-4. 统一Router Tool；
-5. PTC/Code Mode；
-6. 子Agent隔离。
-
-每组记录模型请求的Token序列摘要、缓存命中、Prefill、延迟、Tool选择和任务成功率。第一轮目标不是训练新模型，而是确认插件动态加载在DeepSeek Harness中到底如何影响模型输入和KV Cache。
-
-## 十、普通模式的请求链
+## 十二、普通模式的请求链
 
 当前源码与官方`master`提交`47f943859bef60e4160492346772ded9b24f765a`逐文件一致。普通模式的调用链已经确认。
 
-### 10.1 System Prompt与Tool Schema统一组装
+### 12.1 System Prompt与Tool Schema统一组装
 
 `packages/core/system-prompt`维护Sections、动态Context、Tool Schema和Prompt变量。Tool Registry不是由Agent Loop单独查询，而是向System Prompt服务注册一个Tool Provider。每次组装同时得到：
 
@@ -200,7 +236,7 @@ packages/core/system-prompt/src/index.ts
 packages/core/tools/src/index.ts
 ```
 
-### 10.2 每个Step生成一份冻结请求
+### 12.2 每个Step生成一份冻结请求
 
 Agent Loop在每个Step开始前执行Prompt Assembly，再使用本次的`system`、`tools`和`session.deriveMessages()`构造请求。请求在发送前执行深冻结，因此当前Step使用的是一份固定视图，插件变化应在后续Step重新组装时体现。
 
@@ -213,7 +249,7 @@ packages/core/agent-loop/src/agent.ts
 packages/core/session
 ```
 
-### 10.3 DeepSeek请求中的实际顺序
+### 12.3 DeepSeek请求中的实际顺序
 
 DeepSeek Adapter将System Prompt放入第一条`system`消息，随后序列化Session Messages；Tool Schema通过Chat Completions请求的独立`tools`字段发送：
 
@@ -235,7 +271,7 @@ packages/llm/llm-deepseek/src/serialize.ts
 .agents/notes/archived/architecture/2026-06-11-tool-schemas-in-prompt-assembly.zh.md
 ```
 
-### 10.4 DeepSeek缓存命中统计
+### 12.4 DeepSeek缓存命中统计
 
 DeepSeek返回的`prompt_tokens`包含命中和未命中的输入Token。Adapter按以下方式转换：
 
@@ -258,7 +294,7 @@ packages/llm/llm/src/types.ts
 packages/llm/token-meter/src/usage-projection.ts
 ```
 
-### 10.5 Skill目录采用追加式替换
+### 12.5 Skill目录采用追加式替换
 
 `tool-skill`会在每次`agent/pre-step`重新获取Skill目录，对Skill名称和描述计算Digest。目录变化时，不修改历史消息，而是追加一条完整替换目录；Skill全部消失时追加空目录，明确禁止使用旧名称。
 
@@ -274,7 +310,7 @@ packages/skill/tool-skill/src/index.ts
 .agents/notes/implemented/feature/2026-07-27-skill-catalog-hot-refresh.zh.md
 ```
 
-### 10.6 Compaction已经专门优化KV Cache
+### 12.6 Compaction已经专门优化KV Cache
 
 旧Compaction使用新的摘要System Prompt和扁平Transcript，导致从第一个Token起就无法复用刚刚预热的对话缓存。当前实现改为：
 
@@ -293,7 +329,7 @@ packages/skill/tool-skill/src/index.ts
 .agents/notes/implemented/bug-fix/2026-07-21-compaction-summary-prefix-cache-reuse.zh.md
 ```
 
-### 10.7 动态注册和卸载何时生效
+### 12.7 动态注册和卸载何时生效
 
 System Prompt、Context、Variable和Tool注册都是Cordis Effect，卸载插件会执行对应Disposer。注册或卸载完成后，下一Step重新执行`systemPrompt.assemble()`，因此会看到新的System Prompt和Tool集合。
 
@@ -320,7 +356,7 @@ packages/core/agent-loop/src/tool-calls.ts
 vendor/cordis/src/fiber.ts
 ```
 
-## 十一、Native、Code和Both模式
+## 十三、Native、Code和Both模式
 
 Tool Runtime支持三种模型可见方式：
 
@@ -330,7 +366,7 @@ Tool Runtime支持三种模型可见方式：
 |Code|只有`run_code`|包含完整Tools SDK|只能直接调用`run_code`|
 |Both|真实Tools+`run_code`|包含完整Tools SDK|两种方式都可用|
 
-### 11.1 Code Mode并没有隐藏真实工具信息
+### 13.1 Code Mode并没有隐藏真实工具信息
 
 Code Mode中，DeepSeek请求的原生`tools`字段只有`run_code`，但全部真实工具会被渲染成SDK文本放进System Prompt。SDK包含工具名、说明、参数类型和返回类型。
 
@@ -347,7 +383,7 @@ Code：
 
 SDK和Tool Schema都按工具名排序。仅替换Tool执行实现、而名称、说明、参数和返回类型完全不变时，模型可见Header可以保持不变。
 
-### 11.2 Code Mode的缓存收益来自减少往返
+### 13.2 Code Mode的缓存收益来自减少往返
 
 Code Mode可以在一次`run_code`中组合多个真实工具，嵌套调用结果也不必全部进入模型History。它的主要收益可能来自：
 
@@ -358,7 +394,7 @@ Code Mode可以在一次`run_code`中组合多个真实工具，嵌套调用结�
 
 如果真实工具集合长期稳定，这些收益可能降低任务总Prefill；如果工具集合频繁变化，完整SDK位于System Prompt，前缀失效仍然明显。
 
-### 11.3 Both模式
+### 13.3 Both模式
 
 Both模式同时暴露原生Tools和完整SDK，同一能力会出现在两处，通常是模型可见内容最大的模式。它适合迁移和诊断，但不一定适合追求Token或缓存效率。
 
@@ -371,9 +407,9 @@ packages/core/tools/src/ts-types.ts
 packages/core/tools/src/py-types.ts
 ```
 
-## 十二、Session、Skill和Runtime Context
+## 十四、Session、Skill和Runtime Context
 
-### 12.1 模型可见内容以Session Log为准
+### 14.1 模型可见内容以Session Log为准
 
 普通Agent Loop不会把临时字符串直接插入模型请求。能够进入模型History的主要事件是：
 
@@ -395,7 +431,7 @@ ordered tool schemas
 
 它不记录History、API Key、Base URL和HTTP Header。第一次请求记为`initial`，新Loop接管已有Session时记为`resume`，同一Loop内Header变化记为`change`。
 
-### 12.2 Skill目录和正文
+### 14.2 Skill目录和正文
 
 Skill目录变化采用完整追加式替换，旧目录仍保留在History中，由新消息声明“以后使用这份完整目录”。Skill全部删除时追加空目录Tombstone。
 
@@ -408,7 +444,7 @@ Skill正文没有Unload协议：
 
 所以当前“卸载Skill”只撤销未来发现和未来调用，不能让模型忘记已经看过的正文。
 
-### 12.3 Runtime Context
+### 14.3 Runtime Context
 
 动态Runtime Context也采用完整快照追加：
 
@@ -429,9 +465,9 @@ packages/core/agent-loop/src/runtime-context.ts
 packages/skill/tool-skill/src/index.ts
 ```
 
-## 十三、Preset和Sub-Agent
+## 十五、Preset和Sub-Agent
 
-### 13.1 Preset切换
+### 15.1 Preset切换
 
 Web API只允许尚未开始任何Turn的空Session切换Preset。切换后复用同一个Session标识，但下一次请求会基于新Preset重新组装System Prompt和Tools。
 
@@ -439,7 +475,7 @@ Web API只允许尚未开始任何Turn的空Session切换Preset。切换后复�
 
 Resume时会重新读取当前Preset内容，并无条件写入一份`request/header`，原因标记为`resume`。如果同名Preset在进程重启前后发生变化，恢复后的Header可能与旧请求不同，是否命中缓存取决于最终Token前缀，而不是Session ID。
 
-### 13.2 Sub-Agent
+### 15.2 Sub-Agent
 
 每个Sub-Agent具有独立Session、History和`request/header`，可以通过Tool Filter收窄继承的工具集合。
 
@@ -458,7 +494,7 @@ packages/subagent/subagent-spawn-in-process
 packages/subagent/subagent-fork-in-process
 ```
 
-## 十四、三类Cache不能混淆
+## 十六、三类Cache不能混淆
 
 Harness源码中存在多种名为Cache的结构，但只有Provider侧Prefix Cache是Transformer KV Cache。
 
@@ -477,7 +513,7 @@ Harness不保存、删除或迁移DeepSeek的KV Cache，只能：
 2. 从Provider Usage读取`cacheReadTokens`；
 3. 通过真实请求实验观察命中和延迟。
 
-### 14.1 Usage统计边界
+### 16.1 Usage统计边界
 
 Harness约定：
 
@@ -492,7 +528,7 @@ Harness约定：
 
 Token Meter累计的是Agent Loop逻辑Step的Usage，不是所有HTTP请求的完整账单。同一Step重试时采用最后一次Usage，Compaction辅助请求和其他直接LLM请求也不一定进入同一个累计Projection。后续实验应同时保存原始Provider Usage，不能只读取Token Meter总数。
 
-## 十五、当前结论和实验重点
+## 十七、当前结论和实验重点
 
 源码已经支持以下判断：
 
@@ -512,6 +548,7 @@ Token Meter累计的是Agent Loop逻辑Step的Usage，不是所有HTTP请求的�
 |Native动态集合|Schema小、集合变化|
 |Code动态集合|`run_code`稳定、SDK变化|
 |阶段内固定集合|每阶段只失效一次|
+|统一Router Tool|Schema稳定、调用间接|
 |Spawn Sub-Agent|独立短History|
 |Fork Sub-Agent|尝试复用父History前缀|
 
