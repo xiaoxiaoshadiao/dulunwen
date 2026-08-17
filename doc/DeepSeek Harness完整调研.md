@@ -1,12 +1,14 @@
 # DeepSeek Harness完整调研
 
-> 本文从DeepSeek Harness整体架构开始，逐层进入Agent Loop、System Prompt、Tool、Session、Skill、Preset、Sub-Agent和KV Cache。源码快照与官方`master`提交`47f943859bef60e4160492346772ded9b24f765a`逐文件一致。
+> 本文从产品侧关心的上下文选择、能力加载、权限、执行反馈和成本问题出发，再逐层进入DeepSeek Harness的Agent Loop、System Prompt、Tool、Session、Skill、Preset、Sub-Agent和KV Cache。源码快照与官方`master`提交`47f943859bef60e4160492346772ded9b24f765a`逐文件一致。
 
 ## 一、DeepSeek Harness是什么
 
 DeepSeek Harness不是模型，而是围绕模型运行Agent任务的框架。模型负责生成文本或Tool Call，Harness负责准备上下文、暴露能力、执行操作、记录状态以及处理权限和恢复。
 
 它采用Cordis插件架构。Agent Loop、LLM Adapter、Tools、Session、文件系统、Shell、Skill、Sub-Agent、Preset和界面均由插件提供，通过Profile和Bundle组合成不同产品形态。当前源码版本为`0.1.0-rc.5`，仍处于开发者预览阶段。
+
+从产品角度看，读这份源码不是为了复述模块列表，而是回答：能力如何进入模型上下文、如何按作用域组合、变化后何时生效、执行失败如何返回、长期Session如何维护，以及这些选择如何影响成本和可靠性。
 
 ## 二、整体架构
 
@@ -528,9 +530,9 @@ Harness约定：
 
 Token Meter累计的是Agent Loop逻辑Step的Usage，不是所有HTTP请求的完整账单。同一Step重试时采用最后一次Usage，Compaction辅助请求和其他直接LLM请求也不一定进入同一个累计Projection。后续实验应同时保存原始Provider Usage，不能只读取Token Meter总数。
 
-## 十七、当前结论和实验重点
+## 十七、对产品设计的结论与验证重点
 
-源码已经支持以下判断：
+结合源码和WorkBuddy的产品实践，目前可以形成以下判断：
 
 1. **动态Tool变化会改变模型请求头。** Native改变`tools`，Code改变System Prompt中的SDK，Both通常两处都变；
 2. **每个Step使用固定请求视图。** 但Tool执行前仍查实时Registry，因此卸载时存在Schema与执行状态短暂不一致；
@@ -539,6 +541,8 @@ Token Meter累计的是Agent Loop逻辑Step的Usage，不是所有HTTP请求的�
 5. **Code Mode不天然解决动态工具缓存问题。** 它更可能通过减少调用轮数和History体积获益；
 6. **Sub-Agent可以隔离History和工具集合。** 但是否复用父Agent缓存取决于Header是否完全一致；
 7. **缓存成本应进入插件选择目标。** 能力相关性相近时，复用当前插件集合可能比频繁切换更便宜。
+
+需要避免把结论扩大为“产品应该自动检索并安装Plugin”。现有实践已经证明Tool和Skill的渐进式加载有价值，但Plugin更接近安装、分发和作用域管理单元。运行时选择应该停在Plugin、Skill还是Tool层，需要由真实产品流程和数据决定。
 
 第一轮实验应优先比较：
 

@@ -1,10 +1,12 @@
 # DeepSeek Harness简短调研
 
-> **DeepSeek Harness把Agent需要的上下文、工具、状态和执行能力拆成了可组合的插件。我们看源码时重点关注：插件变化以后，模型输入、Tool执行和KV Cache会发生什么。**
+> **WorkBuddy的实践说明，产品团队已经在关注上下文选择、能力渐进式加载、Prompt Cache、权限和执行反馈。我们看DeepSeek Harness源码，是想知道这些产品问题在一个开源Harness里具体怎么实现。**
 
-## 一、先看DeepSeek Harness在干什么
+## 一、为什么看DeepSeek Harness
 
-DeepSeek Harness不是模型，而是模型外部的Agent运行框架。它负责组装上下文、暴露Tools、执行操作、保存Session，并管理权限、取消、恢复和子Agent。
+WorkBuddy文章给出的核心判断是：模型只是起点，Agent能否成为产品，还取决于模型每一步看到什么、能使用什么能力、执行后如何验证和纠正。文章已经明确采用意图识别、Tool/Skill渐进式加载、分层Memory、Sub-Agent隔离和Prompt Cache等机制。
+
+DeepSeek Harness提供了一份可以直接阅读的实现。它不是模型，而是模型外部的Agent运行框架，负责组装上下文、暴露Tools、执行操作、保存Session，并管理权限、取消、恢复和子Agent。
 
 ```text
 用户输入
@@ -152,9 +154,15 @@ Sub-Agent提供了更清楚的作用域：任务相关Plugin、Prompt、Tools和
 - Code Mode原生只暴露`run_code`，但完整Tools SDK仍在System Prompt中；
 - Skill和Runtime Context变化采用追加式完整替换。
 
-## 九、最后怎么看
+## 九、对产品和我们的启发
 
-DeepSeek Harness已经把Plugin、Tool、Prompt、Session和缓存问题连接在一起。它说明能力检索不能只优化“找得准不准”，还要考虑：
+DeepSeek Harness已经把Plugin、Tool、Prompt、Session和缓存问题连接在一起。结合WorkBuddy的产品实践，可以得到三个判断：
+
+1. **渐进式能力加载是真实需求。** 能力太多会增加上下文成本和选择干扰；
+2. **动态Plugin Retrieval是否必要尚未确认。** 产品可能只需要由人预装Plugin，再在运行时检索Skill和Tool；
+3. **能力选择必须与执行结果一起评价。** 只看Recall不够，还要看任务完成、权限、延迟、缓存和失败恢复。
+
+因此，能力检索不能只优化“找得准不准”，还要考虑：
 
 ```text
 暴露多少能力
@@ -164,8 +172,6 @@ DeepSeek Harness已经把Plugin、Tool、Prompt、Session和缓存问题连接�
 任务结束后能否清理运行时和上下文
 ```
 
-当前最值得验证的方案是：**任务阶段开始时选择并加载一组Plugins，阶段内保持稳定，阶段完成后统一卸载。**
-
-下一步实验只需要先比较Native动态Tools、Code动态SDK和阶段内固定Plugin Set在Cache Hit、TTFT、任务成功率和无效Tool Call上的差异。
+当前比较合理的候选方案是：**任务阶段开始时选择并加载一组能力，阶段内保持稳定，阶段完成后统一收尾。** 但在做实验前，应先向产品团队确认能力检索发生在Plugin、Skill还是Tool层，以及当前最主要的问题究竟是能力选错、上下文成本、冷启动、权限还是任务完成率。
 
 更完整的架构、源码链路和实验设计见《DeepSeek Harness完整调研》。
