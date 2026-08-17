@@ -47,13 +47,52 @@ step/end / turn/end   收尾
 
 **但这只解决了顺序抖动，没解决集合变化。** 上面那组再装一个`edit`，字典序把它排在第二位，变成`[bash, edit, read, write]`——`edit`后面的每一个工具位置都右移了，从这里往后的Token全部对不上。
 
-拿仓库自己的两份快照实测：native模式19个工具，both模式在同一组里多了一个`run_code`，它字典序排在`read`和`send_message`之间，也就是第12位。按DeepSeek线格式序列化后，公共前缀只有10,739字符，占22,848字符的**47%**——加一个工具，超过一半的Tool Schema要重新Prefill。
+仓库自带的两份快照正好能量出这个代价。Native是19个工具，Both在同一组里只多了一个`run_code`：
+
+```text
+Native  … job_output, list_agents, ralph, read,           send_message, skill, …
+Both    … job_output, list_agents, ralph, read, run_code, send_message, skill, …
+                                                 ↑ 从这里开始，后面全部对不上
+```
+
+`run_code`落在第12位（共20个）。按DeepSeek线格式序列化后，公共前缀只剩10,739字符，占22,848字符的**47%**——多装一个工具，超过一半的Tool Schema要重新Prefill。
 
 ### 2. Code Mode不是省Token的方案
 
 **容易产生的误解。** Code Mode下`tools`字段只剩一个`run_code`，看起来把19个工具的Schema全省掉了。
 
-**实际发生的事。** 那19个工具被改写成TypeScript声明搬进了System Prompt。拿`bash`举例：Native下它是3,345字符的JSON Schema，Code Mode下它是3,072字符的TS声明，说明文字一字不差地搬了过去，只是从`{"name":"bash","description":"Execute a bash command …"}`变成了`/** Execute a bash command … */ bash: { command: string; … }`。字数没少，位置还更靠前。
+**实际发生的事。** 那19个工具没有消失，它们被改写成TypeScript声明，搬进了System Prompt。同一个`bash`工具，两种模式下长这样：
+
+```text
+Native —— 待在 tools 字段里，3,345 字符
+{
+  "name": "bash",
+  "description": "Execute a bash command (`bash -c`) and return its stdout/stderr. …",
+  "parameters": {
+    "properties": {
+      "command":     { "type": "string", "description": "The bash command to execute." },
+      "description": { "type": "string", "description": "Clear, concise description …" },
+      "timeoutMs":   { "type": "number", "description": "Timeout in milliseconds. …" }
+    },
+    "required": ["command", "description"]
+  }
+}
+```
+
+```text
+Code —— 搬进 System Prompt，3,072 字符
+/** Execute a bash command (`bash -c`) and return its stdout/stderr. … */
+bash: {
+  /** The bash command to execute. */
+  command: string;
+  /** Clear, concise description … */
+  description: string;
+  /** Timeout in milliseconds. … */
+  timeoutMs?: number;
+}
+```
+
+说明文字一个字都没改，只是换了种写法。**字数几乎一样，但从请求靠后的`tools`字段挪到了靠前的System Prompt。**
 
 三份快照合起来看：
 
@@ -96,7 +135,17 @@ Step开始：组装并深冻结请求（含 web_search）
 
 ### 5. 只有Compaction会改写历史中段
 
-**举个例子。** 一个会话攒到第50条消息，上下文用到了窗口的80%，自动压缩触发。它不删任何日志，而是追加一条摘要消息并打上`surfaceOp: { op: 'replace', start: 5, end: 40 }`。模型看到的列表于是从"1到50"变成"1到4 + 摘要 + 41到50"，日志里第5到40条还完整躺着，只是不再投影给模型。
+**举个例子。** 会话攒到第50条消息，上下文用掉了窗口的80%，自动压缩触发。它一条日志都不删，只是追加一条摘要消息，并打上`surfaceOp: { op: 'replace', start: 5, end: 40 }`：
+
+```text
+日志里（只追加，一条没少）
+  1  2  3  4  5 … 40  41 … 50  + 新追加的摘要
+
+模型看到的（投影之后）
+  1  2  3  4    摘要    41 … 50
+```
+
+第5到40条还完整躺在日志里，只是不再投影给模型了。
 
 **为什么单独拎出来说。** 前面那些机制都只往末尾加东西，请求前缀一个字节不动；只有它动了中间，所以缓存从第5条的位置就作废了。全仓库就这一处。
 
