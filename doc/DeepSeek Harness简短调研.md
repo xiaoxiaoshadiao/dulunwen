@@ -35,19 +35,27 @@ step/end / turn/end   收尾
 | Tool Schema | 工具名、描述、参数JSON Schema | 插件调用`tools.register()` | Chat Completions的独立`tools`字段 |
 | Messages | 用户消息、模型回复、工具结果 | Session Log投影出来 | `messages[1..]` |
 
-三段拼起来就是模型的全部输入。**插件能改动的正是前两段，而前两段位于请求最前面。** 这句话是后面所有问题的根源。
+三段拼起来就是模型的全部输入。插件既能改前两段，也能往第三段末尾追加东西。**区别在于前两段在请求最前面，一改就动前缀；第三段追加在末尾，不动前缀。** 这个区别是后面所有问题的根源，也是它很多设计选择看起来"绕"的原因。
 
 ## 三、我们关心的六个点
 
 ### 1. 工具顺序是字典序，确定，但不等于稳定
 
-无配置时按工具名逐字符排序，同一组工具在任何机器上生成同一顺序（`packages/core/system-prompt/src/index.ts`的`orderTools`）。也可以在配置里写死`toolOrder`，用`<unlisted-tools>`占位表示"其余工具插在这里"。
+**原本会出什么问题。** 插件是并发加载的，注册进来的先后每次都可能不一样。同一组工具，这次拼出`[read, bash, write]`，下次拼出`[bash, write, read]`，内容完全一样但字节不同，缓存从第一个工具就断了。
 
-排序解决的是**同一组工具顺序抖动**，解决不了**工具集合变化**。拿仓库自己的两份快照算：native模式19个工具，both模式在同一组里多了一个`run_code`，字典序上它排在`read`和`send_message`之间，也就是第12位。按DeepSeek线格式序列化后，两者的公共前缀只有10,739字符，占22,848字符的**47%**——加一个工具，超过一半的Tool Schema要重新Prefill。
+**它怎么做。** 不管谁先注册，一律按工具名逐字符排序，永远是`[bash, read, write]`（`packages/core/system-prompt/src/index.ts`的`orderTools`）。也可以在配置里写死`toolOrder`，用`<unlisted-tools>`占位表示"其余工具插在这里"。
+
+**但这只解决了顺序抖动，没解决集合变化。** 上面那组再装一个`edit`，字典序把它排在第二位，变成`[bash, edit, read, write]`——`edit`后面的每一个工具位置都右移了，从这里往后的Token全部对不上。
+
+拿仓库自己的两份快照实测：native模式19个工具，both模式在同一组里多了一个`run_code`，它字典序排在`read`和`send_message`之间，也就是第12位。按DeepSeek线格式序列化后，公共前缀只有10,739字符，占22,848字符的**47%**——加一个工具，超过一半的Tool Schema要重新Prefill。
 
 ### 2. Code Mode不是省Token的方案
 
-以为Code Mode只暴露一个`run_code`所以更省，这个印象是错的。真实工具会被渲染成TypeScript SDK文本塞进System Prompt。同样三份快照：
+**容易产生的误解。** Code Mode下`tools`字段只剩一个`run_code`，看起来把19个工具的Schema全省掉了。
+
+**实际发生的事。** 那19个工具被改写成TypeScript声明搬进了System Prompt。拿`bash`举例：Native下它是3,345字符的JSON Schema，Code Mode下它是3,072字符的TS声明，说明文字一字不差地搬了过去，只是从`{"name":"bash","description":"Execute a bash command …"}`变成了`/** Execute a bash command … */ bash: { command: string; … }`。字数没少，位置还更靠前。
+
+三份快照合起来看：
 
 | 模式 | 原生工具数 | Tool Schema字符 | System Prompt字符 | 合计 |
 |---|---|---|---|---|
@@ -55,52 +63,57 @@ step/end / turn/end   收尾
 | Code | 1（`run_code`） | 902 | 27,968 | **28,870** |
 | Both | 20 | 22,358 | 27,809 | **50,167** |
 
-Code Mode把内容从`tools`字段搬到了System Prompt，**总量还略微变大，而且搬到了更靠前的位置**。它真正的收益不在Header，在于一段代码可以连续调多个工具、中间结果不进模型历史、模型与Harness的往返次数变少。要比就比整个任务的总成本和成功率，不能比单次Header长度。
+**那它图什么。** 收益不在Header而在往返：一段`run_code`里可以连着调五个工具，中间四个的返回值不进模型历史，模型和Harness之间少跑四轮。所以要比就比整个任务的总Token和成功率，只比单次Header长度会得出反的结论。
 
 ### 3. 模型的视图按Step冻结，执行时却查实时注册表
 
-每个Step开始时组装一次，请求对象做深冻结（`deepFreeze`）后发出。但模型生成Tool Call之后，Harness执行前会重新去实时注册表里找这个工具：
+**举个例子。** 第3步开始时`web_search`还在，Schema进了请求，模型生成了一个`web_search`调用。就在模型生成的这几秒里，另一条路径把web插件卸载了。Harness拿到这个调用去执行，它不看请求里那份Schema快照，而是重新去实时注册表里找——找不到，返回`UNKNOWN_TOOL`。
 
 ```text
-模型请求里有 web_search
-→ 模型生成 web_search 调用
-→ 插件在执行前被卸载
-→ 实时注册表找不到
-→ UNKNOWN_TOOL
+Step开始：组装并深冻结请求（含 web_search）
+模型生成：web_search 调用
+执行之前：插件被卸载
+执行时刻：查实时注册表 → 找不到 → UNKNOWN_TOOL
 ```
 
-而且并行执行时，**尚未启动的调用会重新分类一次**，源码注释写得很直白："Commit before classifying again so registry changes affect unstarted calls"。所以"模型看到的"和"真正能执行的"之间存在一个窗口。这不是bug，是它明确选择的设计，但我们要做运行时能力增删就必须处理这个窗口。
+**并行时还要更细一点。** 模型一次发了5个调用，跑完前2个的时候插件集合变了，剩下3个会用**新的**注册表重新分类。源码注释写得很直白："Commit before classifying again so registry changes affect unstarted calls"。
+
+**为什么这重要。** "模型以为自己有什么"和"运行时真正有什么"之间存在一个窗口。这不是bug，是它明确选的设计，但我们要做运行时能力增删就得处理这个窗口：要么阶段内锁住插件集合，要么给插件加执行租约，要么就接受失败、让模型下一步重新规划。
 
 ### 4. 卸载不等于遗忘
 
-Skill目录变了怎么办？它不去改历史消息，而是追加一条**完整的新目录**，里面直接写"这份完整目录替换本会话中此前所有可用技能列表"，一个技能都不剩时就追加一份空目录加一句"不要使用早先目录里的名字"。
+**举个例子。** 用户装了一个"报销流程"Skill，模型调`skill`工具把正文读进来，照着做了两步。这时管理员把这个Skill下架了。下一步模型会收到一份新目录，明说"这份完整目录替换本会话中此前所有可用技能列表"，再调这个名字也会失败。**但前面那段正文原封不动躺在对话历史里**，模型照样看得见，照样可能接着按它做。
 
-但已经通过`skill`工具加载过的技能正文，是作为工具结果留在历史里的，删掉技能文件也删不掉它。仓库自己的README承认了这点：技能正文没有卸载协议。
+**它为什么不直接删。** 删历史中段会让缓存前缀从那个位置断掉，所以它选择追加一份完整新目录来声明旧的作废；一个技能都不剩时就追加一份空目录，加一句"不要使用早先目录里的名字"。这是拿语义干净换缓存稳定。
 
-所以卸载要分三层看：
+所以卸载要分三层看，第三层现在没有机制：
 
-| 层次 | 含义 | 现状 |
-|---|---|---|
-| 执行层 | 工具、服务、进程不能再跑 | Cordis的Disposer可以做干净 |
-| 发现层 | 下一Step不再列出这个能力 | 可以做到 |
-| 上下文层 | 模型不再看到旧说明和旧正文 | **做不到** |
+| 层次 | 含义 | 现状 | 例子 |
+|---|---|---|---|
+| 执行层 | 工具、服务、进程不能再跑 | Cordis的Disposer可以做干净 | 卸载后再调就是`UNKNOWN_TOOL` |
+| 发现层 | 下一Step不再列出这个能力 | 可以做到 | 下一份目录里没有这个名字了 |
+| 上下文层 | 模型不再看到旧说明和旧正文 | **做不到** | 已读进来的Skill正文还在历史里 |
 
 ### 5. 只有Compaction会改写历史中段
 
-Session Log本身是只追加的，但消息投影层有一个`replace`操作。Compaction压缩历史时，追加一条摘要消息并标记`surfaceOp: { op: 'replace', start, end }`，把中间那段历史从模型可见列表里换掉。这是全仓库唯一会改动历史中段的机制，也就是唯一会让缓存前缀从中间断掉的地方。
+**举个例子。** 一个会话攒到第50条消息，上下文用到了窗口的80%，自动压缩触发。它不删任何日志，而是追加一条摘要消息并打上`surfaceOp: { op: 'replace', start: 5, end: 40 }`。模型看到的列表于是从"1到50"变成"1到4 + 摘要 + 41到50"，日志里第5到40条还完整躺着，只是不再投影给模型。
 
-有意思的是，它连摘要请求本身都做了缓存优化：摘要指令不放在新的System Prompt里，而是**复用原请求的System Prompt和Tool Schema，把指令追加到对话最后**，让这次辅助调用成为上一次请求的真前缀。对应的修复笔记原话是"a first token that differs — a different system prompt — invalidates the entire cached prefix"。
+**为什么单独拎出来说。** 前面那些机制都只往末尾加东西，请求前缀一个字节不动；只有它动了中间，所以缓存从第5条的位置就作废了。全仓库就这一处。
+
+**它自己那次摘要调用反而很讲究。** 摘要指令不另起一个System Prompt，而是**复用原请求的System Prompt和Tool Schema，把"请总结"追加在对话最后**，让这次辅助调用变成上一次请求的真前缀。即使摘要根本不会调工具，也照样把原Tool Schema带上，否则Token序列从tools那个位置就对不齐了。修复笔记的原话是"a first token that differs — a different system prompt — invalidates the entire cached prefix"。
 
 ### 6. 缓存Harness管不了，只能读
 
-DeepSeek请求里没有任何缓存标记字段，命中与否完全由服务端按Token前缀判断。Harness能做的只有两件事：把请求前缀做稳定，以及从返回的usage里读命中数：
+**请求侧没有任何抓手。** DeepSeek的请求体字段就是`model`、`messages`、`stream`、`tools`那几个，**没有一个字段能说"这段请帮我缓存"**，也没有Anthropic那种`cache_control`标记。命中与否完全由服务端按Token前缀自己判断。Harness能做的只有两件事：把前缀做稳，以及从返回里读结果。
+
+**读的时候有个坑。** 假设一次请求返回`prompt_tokens: 8000`、`prompt_cache_hit_tokens: 6500`，Harness换算成：
 
 ```text
-cacheReadTokens = prompt_tokens_details.cached_tokens 或 prompt_cache_hit_tokens
-inputTokens     = prompt_tokens - cacheReadTokens
+cacheReadTokens = 6500
+inputTokens     = 8000 - 6500 = 1500
 ```
 
-注意`inputTokens`在这里表示**未命中**的输入，不是总输入。DeepSeek这条链路不产生`cacheWriteTokens`。
+这里的`inputTokens`是**没命中的那1500**，不是总输入8000。要算这次请求真实喂进去多少，得用`inputTokens + cacheReadTokens`。做实验时如果直接拿`inputTokens`当输入量，会把上下文规模和成本都低估一大截。另外DeepSeek这条链路不产生`cacheWriteTokens`，未命中的部分就留在`inputTokens`里。
 
 ## 四、这对我们意味着什么
 
