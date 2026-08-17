@@ -1,177 +1,115 @@
 # DeepSeek Harness简短调研
 
-> **WorkBuddy的实践说明，产品团队已经在关注上下文选择、能力渐进式加载、Prompt Cache、权限和执行反馈。我们看DeepSeek Harness源码，是想知道这些产品问题在一个开源Harness里具体怎么实现。**
+> **一句话：** Harness是模型外面那层跑Agent的程序。它每一步把System Prompt、Tool Schema和历史消息拼成一次模型请求，模型回什么它就执行什么，全过程写进一份只追加的Session Log。
+>
+> 源码版本：官方`master`提交`47f943859bef60e4160492346772ded9b24f765a`（`0.1.0-rc.5`）。文中数字全部来自仓库自带的快照测试。
 
-## 一、为什么看DeepSeek Harness
+## 一、它怎么工作：一次对话的真实事件流
 
-WorkBuddy文章给出的核心判断是：模型只是起点，Agent能否成为产品，还取决于模型每一步看到什么、能使用什么能力、执行后如何验证和纠正。文章已经明确采用意图识别、Tool/Skill渐进式加载、分层Memory、Sub-Agent隔离和Prompt Cache等机制。
-
-DeepSeek Harness提供了一份可以直接阅读的实现。它不是模型，而是模型外部的Agent运行框架，负责组装上下文、暴露Tools、执行操作、保存Session，并管理权限、取消、恢复和子Agent。
+下面是仓库快照`examples/acp-agent/tests/snapshots/text-turn/session.jsonl`的完整记录，用户只说了一句"Reply with exactly the word: PONG"：
 
 ```text
-用户输入
-→ Agent Loop
-→ System Prompt + Tools + Session
-→ DeepSeek模型
-→ Tool Call
-→ Harness执行Tool并记录结果
+agent/inbox/spliced   用户消息进入收件箱
+turn/start            开启第1个Turn
+step/start            开启第1个Step
+user/message          用户原话
+user/message          运行时上下文快照（沙箱策略、审批策略等）
+request/header        本次请求的System Prompt和Tool Schema全文
+request/context       provider、model、context window
+assistant/chunk × N   流式返回的每一片
+assistant/message     组装好的完整回复（带usage）
+step/end / turn/end   收尾
 ```
 
-它基于Cordis实现“一切皆插件”。Agent Loop、Tools、Skill、文件系统、Shell、模型适配器和界面都可以由插件注册并通过配置组合。
+三件事从这里就能看清：
 
-## 二、看源码时主要盯了五个问题
+- **Turn套Step。** 一次用户输入是一个Turn，一个Step等于一次模型请求加上这次请求引发的工具执行。模型每返回一批Tool Call，就多一个Step。代码在`packages/core/agent-loop/src/agent.ts`的`turn()`和`step()`。
+- **Step数量没有上限。** 循环靠"模型这次没有再发Tool Call"来结束，不靠计数器。
+- **模型看到的东西全部落盘。** `request/header`里存着当次的System Prompt原文和Tool Schema数组，所以任何一次请求都能离线重建。
 
-1. Plugin和Tool到底是什么关系，模型调用的是谁？
-2. Tool为什么要排序，排序能否保证KV Cache稳定？
-3. Native Mode和Code Mode有什么区别？
-4. 插件在模型请求期间加载或卸载，会不会出现状态不一致？
-5. Plugin已经卸载后，模型看过的Prompt和Skill是否真的消失？
+## 二、模型每次看到的只有三段
 
-## 三、Plugin和Tool是什么关系
+| 段 | 装什么 | 谁往里写 | 在DeepSeek请求里的位置 |
+|---|---|---|---|
+| System Prompt | 身份、persona、每个工具的使用说明 | 插件调用`systemPrompt.section()` | `messages[0]`，`role: system` |
+| Tool Schema | 工具名、描述、参数JSON Schema | 插件调用`tools.register()` | Chat Completions的独立`tools`字段 |
+| Messages | 用户消息、模型回复、工具结果 | Session Log投影出来 | `messages[1..]` |
 
-Plugin是运行时模块，可以注册Tool、Prompt、Skill、Service、后台任务或模型实现。Tool是Plugin向模型暴露的一种具体能力。
+三段拼起来就是模型的全部输入。**插件能改动的正是前两段，而前两段位于请求最前面。** 这句话是后面所有问题的根源。
 
-```text
-Plugin加载
-→ 注册Tool
-→ Tool Schema进入模型请求
-→ 模型调用Tool
-→ Harness执行Plugin提供的函数
-```
+## 三、我们关心的六个点
 
-**模型通常调用Tool，不直接调用Plugin。** Plugin决定Agent拥有哪些能力，Tool负责具体执行。
+### 1. 工具顺序是字典序，确定，但不等于稳定
 
-我们后续所说的Plugin Retrieval，发生在Tool Call之前：
+无配置时按工具名逐字符排序，同一组工具在任何机器上生成同一顺序（`packages/core/system-prompt/src/index.ts`的`orderTools`）。也可以在配置里写死`toolOrder`，用`<unlisted-tools>`占位表示"其余工具插在这里"。
 
-```text
-先选择并加载Plugin
-→ Plugin注册Tools
-→ 模型再选择和调用Tools
-```
+排序解决的是**同一组工具顺序抖动**，解决不了**工具集合变化**。拿仓库自己的两份快照算：native模式19个工具，both模式在同一组里多了一个`run_code`，字典序上它排在`read`和`send_message`之间，也就是第12位。按DeepSeek线格式序列化后，两者的公共前缀只有10,739字符，占22,848字符的**47%**——加一个工具，超过一半的Tool Schema要重新Prefill。
 
-## 四、Tool排序与KV Cache
+### 2. Code Mode不是省Token的方案
 
-KV Cache依赖请求Token前缀完全一致。相同Tool集合如果因为并发加载顺序不同，分别生成：
+以为Code Mode只暴露一个`run_code`所以更省，这个印象是错的。真实工具会被渲染成TypeScript SDK文本塞进System Prompt。同样三份快照：
 
-```text
-[A, B, C]
-[B, A, C]
-```
+| 模式 | 原生工具数 | Tool Schema字符 | System Prompt字符 | 合计 |
+|---|---|---|---|---|
+| Native | 19 | 21,456 | 3,456 | 24,912 |
+| Code | 1（`run_code`） | 902 | 27,968 | **28,870** |
+| Both | 20 | 22,358 | 27,809 | **50,167** |
 
-模型请求也会不同。DeepSeek Harness按名称或配置顺序排列Tools，使同一集合稳定生成同一顺序。
+Code Mode把内容从`tools`字段搬到了System Prompt，**总量还略微变大，而且搬到了更靠前的位置**。它真正的收益不在Header，在于一段代码可以连续调多个工具、中间结果不进模型历史、模型与Harness的往返次数变少。要比就比整个任务的总成本和成功率，不能比单次Header长度。
 
-但排序只能解决**同一集合顺序不稳定**，不能解决**Tool集合发生变化**：
+### 3. 模型的视图按Step冻结，执行时却查实时注册表
+
+每个Step开始时组装一次，请求对象做深冻结（`deepFreeze`）后发出。但模型生成Tool Call之后，Harness执行前会重新去实时注册表里找这个工具：
 
 ```text
-旧：[A, C, D]
-新：[A, B, C, D]
-```
-
-新增B后，从B的位置开始发生分叉，后面的Tools和History仍可能需要重新Prefill。
-
-> **排序保证确定性，不保证动态增删Tool时KV Cache不变。**
-
-## 五、Native Mode和Code Mode
-
-|模式|原生Tool Schema|模型如何使用真实Tools|
-|---|---|---|
-|Native|全部真实Tools|模型直接生成Tool Call|
-|Code|只有`run_code`|模型写代码，代码调用Tools|
-|Both|真实Tools+`run_code`|两种方式都可用|
-
-Code Mode看起来只暴露一个`run_code`，但真实Tools会被渲染成SDK文本放进System Prompt：
-
-```text
-System Prompt + 完整Tools SDK
-Native Tools = [run_code]
-```
-
-因此动态Tool变化仍会修改System Prompt，Code Mode并没有让KV Cache问题消失。
-
-Code Mode真正可能节省的是：
-
-- 一段代码可以连续调用多个Tools；
-- 中间Tool Result不必全部进入模型History；
-- 模型与Harness的往返次数可能更少。
-
-所以Native和Code应该比较**整个任务的总成本和成功率**，而不是只比较一次请求的Tool Schema长度。
-
-## 六、模型视图与执行状态的竞态
-
-DeepSeek Harness在每个Step开始时组装System Prompt和Tool Schema，并冻结当前模型请求。插件在Assembly之后变化，通常到下一Step才会进入模型视图。
-
-但模型生成Tool Call后，Harness执行前会再次查询实时Tool Registry：
-
-```text
-模型请求中存在web_search
-→ 模型生成web_search调用
-→ Plugin在执行前被卸载
-→ 实时Registry找不到Tool
+模型请求里有 web_search
+→ 模型生成 web_search 调用
+→ 插件在执行前被卸载
+→ 实时注册表找不到
 → UNKNOWN_TOOL
 ```
 
-因此：
+而且并行执行时，**尚未启动的调用会重新分类一次**，源码注释写得很直白："Commit before classifying again so registry changes affect unstarted calls"。所以"模型看到的"和"真正能执行的"之间存在一个窗口。这不是bug，是它明确选择的设计，但我们要做运行时能力增删就必须处理这个窗口。
 
-```text
-模型看到的Tool Schema：按Step冻结
-真正执行的Tool Registry：仍然动态
-```
+### 4. 卸载不等于遗忘
 
-两者之间存在短暂竞态。可能的处理方式包括阶段内固定Plugin Set、为Plugin增加执行租约，或允许失败后在下一Step重新规划。
+Skill目录变了怎么办？它不去改历史消息，而是追加一条**完整的新目录**，里面直接写"这份完整目录替换本会话中此前所有可用技能列表"，一个技能都不剩时就追加一份空目录加一句"不要使用早先目录里的名字"。
 
-## 七、卸载不等于模型忘记
+但已经通过`skill`工具加载过的技能正文，是作为工具结果留在历史里的，删掉技能文件也删不掉它。仓库自己的README承认了这点：技能正文没有卸载协议。
 
-Plugin卸载包含三个层次：
+所以卸载要分三层看：
 
-|层次|含义|当前情况|
+| 层次 | 含义 | 现状 |
 |---|---|---|
-|执行层|Tool、Service和进程不能再执行|可以通过Disposer完成|
-|发现层|下一Step不再展示Tool或Skill|可以完成|
-|上下文层|模型不再看到旧Prompt和Skill正文|不能自动完成|
+| 执行层 | 工具、服务、进程不能再跑 | Cordis的Disposer可以做干净 |
+| 发现层 | 下一Step不再列出这个能力 | 可以做到 |
+| 上下文层 | 模型不再看到旧说明和旧正文 | **做不到** |
 
-System Prompt和Tool Schema可以在下一Step重新组装时删除，但会改变请求前缀。Skill目录为了保持Append-only，会追加一条新目录声明旧目录失效；已经加载的Skill正文仍留在History，直到Compaction将其遮蔽。
+### 5. 只有Compaction会改写历史中段
 
-这里存在一个实际取舍：
+Session Log本身是只追加的，但消息投影层有一个`replace`操作。Compaction压缩历史时，追加一条摘要消息并标记`surfaceOp: { op: 'replace', start, end }`，把中间那段历史从模型可见列表里换掉。这是全仓库唯一会改动历史中段的机制，也就是唯一会让缓存前缀从中间断掉的地方。
 
-```text
-真正删除旧上下文
-→ 语义干净，但Cache失效较多
+有意思的是，它连摘要请求本身都做了缓存优化：摘要指令不放在新的System Prompt里，而是**复用原请求的System Prompt和Tool Schema，把指令追加到对话最后**，让这次辅助调用成为上一次请求的真前缀。对应的修复笔记原话是"a first token that differs — a different system prompt — invalidates the entire cached prefix"。
 
-追加失效通知
-→ Cache友好，但模型仍然看过旧信息
-```
+### 6. 缓存Harness管不了，只能读
 
-Sub-Agent提供了更清楚的作用域：任务相关Plugin、Prompt、Tools和History都放在独立Session中，任务结束后整体关闭，只把最终结果返回主Agent。但它也会增加新的Prefill和父子通信成本。
-
-## 八、源码给出的答案
-
-- System Prompt和Tool Schema由同一套Prompt Assembly组装；
-- Tools采用确定性排序；
-- 每个Step生成并冻结一份模型请求；
-- Session Log保存消息和完整请求Header；
-- DeepSeek Adapter可以读取`cacheReadTokens`；
-- Compaction会复用原System、Tools和History头部；
-- Code Mode原生只暴露`run_code`，但完整Tools SDK仍在System Prompt中；
-- Skill和Runtime Context变化采用追加式完整替换。
-
-## 九、对产品和我们的启发
-
-DeepSeek Harness已经把Plugin、Tool、Prompt、Session和缓存问题连接在一起。结合WorkBuddy的产品实践，可以得到三个判断：
-
-1. **渐进式能力加载是真实需求。** 能力太多会增加上下文成本和选择干扰；
-2. **动态Plugin Retrieval是否必要尚未确认。** 产品可能只需要由人预装Plugin，再在运行时检索Skill和Tool；
-3. **能力选择必须与执行结果一起评价。** 只看Recall不够，还要看任务完成、权限、延迟、缓存和失败恢复。
-
-因此，能力检索不能只优化“找得准不准”，还要考虑：
+DeepSeek请求里没有任何缓存标记字段，命中与否完全由服务端按Token前缀判断。Harness能做的只有两件事：把请求前缀做稳定，以及从返回的usage里读命中数：
 
 ```text
-暴露多少能力
-能力集合变化多频繁
-模型请求需要重新Prefill多少
-执行状态是否和模型视图一致
-任务结束后能否清理运行时和上下文
+cacheReadTokens = prompt_tokens_details.cached_tokens 或 prompt_cache_hit_tokens
+inputTokens     = prompt_tokens - cacheReadTokens
 ```
 
-当前比较合理的候选方案是：**任务阶段开始时选择并加载一组能力，阶段内保持稳定，阶段完成后统一收尾。** 但在做实验前，应先向产品团队确认能力检索发生在Plugin、Skill还是Tool层，以及当前最主要的问题究竟是能力选错、上下文成本、冷启动、权限还是任务完成率。
+注意`inputTokens`在这里表示**未命中**的输入，不是总输入。DeepSeek这条链路不产生`cacheWriteTokens`。
 
-更完整的架构、源码链路和实验设计见《DeepSeek Harness完整调研》。
+## 四、这对我们意味着什么
+
+**第一，这套设计已经把缓存当成一等公民了。** 工具字典序、Compaction前缀复用、Skill目录追加式替换、运行时上下文追加在历史末尾而不是塞进System Prompt——这些都不是巧合，仓库的设计笔记里反复出现同一句判断：位置越靠前的改动越贵。我们要做能力检索，就不能只优化"找得准不准"，还要算"这次换能力值不值"。
+
+**第二，动态增删能力的两个硬约束已经摆在这里了。** 一个是Header改动位置越靠前代价越大（47%那个数字），一个是语义残留清不掉（Skill正文留在历史里）。这两条决定了"每轮重新检索一批插件"这种做法在工程上很可能是亏的。
+
+**第三，比较合理的形态是阶段化而不是每轮化。** 任务阶段开始时选一组能力装上，阶段内保持不动，让一次缓存失效被后面多轮调用摊薄，阶段结束再统一收尾。真要做强隔离，Sub-Agent是现成的：独立Session、独立历史、可以用`toolFilter`收窄工具集，结束后整体丢弃。
+
+**第四，在做实验之前，得先向产品团队确认几件事。** 能力检索到底发生在Plugin、Skill还是Tool这一层；插件是人预装还是系统自动装；当前最痛的到底是能力选错、上下文成本、冷启动、权限还是任务完成率。这几个问题的答案不一样，要做的东西完全不一样。
+
+完整的模块设计、源码位置和代码摘录见《DeepSeek Harness完整调研》。
