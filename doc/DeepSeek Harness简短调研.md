@@ -135,19 +135,29 @@ Step开始：组装并深冻结请求（含 web_search）
 
 ### 5. 只有Compaction会改写历史中段
 
+**先说清楚一件事：日志和"模型看到的历史"是两个东西。** Session Log是完整记录，只追加，不删不改。模型请求里那个`messages`数组不是日志本身，而是日志的一个视图——Harness维护一份叫surface的序号清单，`deriveMessages()`按这份清单去日志里取事件、转成消息。日志里有四十多种事件，只有`user/message`、`assistant/message`、`tool/result`这三种有资格上清单。
+
+**每条消息上清单时必须声明怎么上，只有两种方式：** `append`挂到末尾，或者`replace`把清单里已有的一段换成自己。日常对话全是`append`，清单只会变长，请求前缀天然稳定。
+
 **举个例子。** 会话攒到第50条消息，上下文用掉了窗口的80%，自动压缩触发。它一条日志都不删，只是追加一条摘要消息，并打上`surfaceOp: { op: 'replace', start: 5, end: 40 }`：
 
 ```text
-日志里（只追加，一条没少）
+日志（完整保留，一条没少）
   1  2  3  4  5 … 40  41 … 50  + 新追加的摘要
 
-模型看到的（投影之后）
+surface 清单（被 replace 改写）
   1  2  3  4    摘要    41 … 50
 ```
 
-第5到40条还完整躺在日志里，只是不再投影给模型了。
+第5到40条还完整躺在日志里，只是它们的序号被从surface清单上摘掉了，`deriveMessages()`按清单取事件时就不会再取到它们。
 
-**为什么单独拎出来说。** 前面那些机制都只往末尾加东西，请求前缀一个字节不动；只有它动了中间，所以缓存从第5条的位置就作废了。全仓库就这一处。
+**这带来三个后果，方向各不相同。**
+
+- **模型这边：** 之后每一轮请求都不再带这36条原文，只带那条摘要，上下文降下来了。
+- **缓存这边：** `messages`从第5条的位置开始就变了，缓存前缀在那里断掉。前面那些机制都只往末尾加东西、前缀一个字节不动，**只有它动中间，全仓库就这一处**。
+- **人这边：** 界面不读surface，读的是另一条路（只认`append`进来的事件），所以用户在界面上看到的对话仍然完整，不会因为压缩就少一段。源码注释点明了这个区分："The model-visible surface deliberately shadows replaced ranges, so it is the wrong source for a human transcript — a landed replacement would erase conversation the user already saw."
+
+被摘掉的内容也不是找不回来——模型可以用`session_event_search`工具按需搜回本会话的历史事件。所以准确的说法是**默认不再占用上下文，而不是被删掉了**。
 
 **它自己那次摘要调用反而很讲究。** 摘要指令不另起一个System Prompt，而是**复用原请求的System Prompt和Tool Schema，把"请总结"追加在对话最后**，让这次辅助调用变成上一次请求的真前缀。即使摘要根本不会调工具，也照样把原Tool Schema带上，否则Token序列从tools那个位置就对不齐了。修复笔记的原话是"a first token that differs — a different system prompt — invalidates the entire cached prefix"。
 
